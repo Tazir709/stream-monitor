@@ -71,4 +71,3 @@ Supported browsers:
 
 - Session-based stream URLs may expire during long downloads
 - Some streams may appear “online” but still require authentication for download access
-- HLS/DASH stream formats vary between providers, which may affect stability
