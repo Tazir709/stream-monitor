@@ -5,6 +5,10 @@ A Python + PySide6 application for monitoring live streams, capturing previews, 
 The tool tracks multiple stream URLs, detects live status, shows real-time previews, and can automatically download active streams.
 
 ---
+### Tested on:
+- Windows 10 / 11
+- Fedora Linux (recent versions)
+---
 
 ## ✨ Features
 
