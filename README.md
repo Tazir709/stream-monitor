@@ -18,6 +18,12 @@ The tool tracks multiple stream URLs, detects live status, shows real-time previ
 - Auto-retry on status changes (offline → online)
 
 ---
+## 📸 Preview
+
+The application showing multiple stream states:
+
+![Dashboard Preview](app.png)
+---
 
 ## 📦 Requirements
 
