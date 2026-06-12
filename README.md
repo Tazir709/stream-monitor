@@ -46,7 +46,7 @@ pip install PySide6 psutil
 Run the application:
 
 ```bash
-python stream_downloader.py
+python stream_manager.py
 ```
 
 ---
