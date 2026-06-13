@@ -603,7 +603,7 @@ QLineEdit:focus { border-color: #4a7bff; }
 
 /* Buttons — base */
 QPushButton { background: #26262f; border: 1px solid #35354a; border-radius: 5px;
-              padding: 5px 12px; color: #ccc; font-size: 12px; }
+              padding: 6px 10px; color: #ccc; font-size: 12px; min-height: 32px; }
 QPushButton:hover   { background: #2e2e3a; color: #fff; border-color: #4a5570; }
 QPushButton:pressed { background: #1e1e28; }
 QPushButton:disabled{ background: #1e1e24; color: #444; border-color: #2a2a35; }
@@ -613,11 +613,11 @@ QPushButton#addBtn  { background: #1e3a5f; border-color: #2a5a9f; color: #7ab4ff
 QPushButton#addBtn:hover { background: #234878; color: #acd0ff; }
 QPushButton#stopAllBtn { background: #3a1e1e; border-color: #7f2a2a; color: #ff7a7a; }
 QPushButton#stopAllBtn:hover { background: #4a2020; color: #ffaaaa; }
-QPushButton#startBtn { background: #1e3a2a; border-color: #2a7f4a; color: #7affaa; }
+QPushButton#startBtn { background: #1e3a2a; border-color: #2a7f4a; color: #7affaa; padding: 6px 12px; }
 QPushButton#startBtn:hover { background: #234838; }
-QPushButton#stopBtn  { background: #3a1e1e; border-color: #7f2a2a; color: #ff8888; }
+QPushButton#stopBtn  { background: #3a1e1e; border-color: #7f2a2a; color: #ff8888; padding: 6px 12px; }
 QPushButton#stopBtn:hover { background: #4a2222; }
-QPushButton#removeBtn{ color: #888; }
+QPushButton#removeBtn{ color: #888; padding: 6px 10px; }
 QPushButton#removeBtn:hover { color: #ff6666; border-color: #7f2a2a; }
 
 /* Log */
@@ -687,8 +687,8 @@ class StreamDownloaderGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Stream Download Manager")
-        self.setGeometry(100, 100, 1280, 780)
-        self.setMinimumSize(900, 600)
+        self.setGeometry(100, 100, 920, 780)
+        self.setMinimumSize(920, 600)
 
         # Workers
         self.preview_worker = SharedPreviewWorker()
@@ -775,7 +775,7 @@ class StreamDownloaderGUI(QMainWindow):
         ])
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(2, QHeaderView.Fixed)
         hh.setSectionResizeMode(3, QHeaderView.Fixed)
         hh.setSectionResizeMode(4, QHeaderView.Fixed)
@@ -790,9 +790,9 @@ class StreamDownloaderGUI(QMainWindow):
         self._table.setColumnWidth(4, 80)
         self._table.setColumnWidth(5, 48)
         self._table.setColumnWidth(6, 36)
-        self._table.setColumnWidth(7, 64)
-        self._table.setColumnWidth(8, 56)
-        self._table.setColumnWidth(9, 36)
+        self._table.setColumnWidth(7, 85)
+        self._table.setColumnWidth(8, 85)
+        self._table.setColumnWidth(9, 90)
         self._table.verticalHeader().setDefaultSectionSize(64)
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -899,20 +899,20 @@ class StreamDownloaderGUI(QMainWindow):
         self._table.setCellWidget(row, 6, dl_lbl)
 
         # Col 7 — Start
-        start_btn = QPushButton("Start")
+        start_btn = QPushButton("▶ Start")
         start_btn.setObjectName("startBtn")
         start_btn.clicked.connect(lambda _, u=url: self._manual_start(u))
         self._table.setCellWidget(row, 7, start_btn)
 
         # Col 8 — Stop
-        stop_btn = QPushButton("Stop")
+        stop_btn = QPushButton("⏹ Stop")
         stop_btn.setObjectName("stopBtn")
         stop_btn.setEnabled(False)
         stop_btn.clicked.connect(lambda _, u=url: self._stop_download(u))
         self._table.setCellWidget(row, 8, stop_btn)
 
         # Col 9 — Remove
-        rm_btn = QPushButton("✕")
+        rm_btn = QPushButton("Remove")
         rm_btn.setObjectName("removeBtn")
         rm_btn.setToolTip("Remove stream")
         rm_btn.clicked.connect(lambda _, u=url: self._remove_stream(u))
