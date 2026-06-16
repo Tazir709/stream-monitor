@@ -75,7 +75,6 @@ class RateLimiter:
 
 
 def extract_username(url: str) -> str:
-    """Best-effort username extraction from a stream URL."""
     url = url.rstrip("/")
     match = re.search(r'(?:https?://)?[^/]+/([^/?#]+)', url)
     return match.group(1) if match else url
@@ -176,10 +175,6 @@ class SharedPreviewWorker(QThread):
         host = page_url.lower()
         if "chaturbate" in host:
             referer = "https://chaturbate.com/"
-        elif "twitch" in host:
-            referer = "https://www.twitch.tv/"
-        elif "youtube" in host or "youtu.be" in host:
-            referer = "https://www.youtube.com/"
         else:
             referer = ""
 
@@ -230,7 +225,7 @@ class SharedPreviewWorker(QThread):
         last_capture: dict[str, float] = {}
 
         while self._running:
-            # Drain pending (immediate) captures first — but cap to avoid starvation
+            # Drain pending (immediate)
             burst = 0
             while burst < 3:
                 try:
@@ -443,7 +438,7 @@ class DownloadWorker(QThread):
 class StreamChecker(QThread):
     status_signal = Signal(str, object, str)  # (url, StreamStatus, message)
 
-    CHECK_INTERVAL = 90  # seconds between routine checks
+    CHECK_INTERVAL = 90
 
     def __init__(self, ytdlp_path: str = "yt-dlp"):
         super().__init__()
@@ -453,8 +448,6 @@ class StreamChecker(QThread):
 
         self._lock: threading.Lock = threading.Lock()
         self._tracked: dict[str, float] = {}
-
-    # ── public API ──────────────────────────────
 
     def add_stream(self, url: str, force: bool = False):
         with self._lock:
