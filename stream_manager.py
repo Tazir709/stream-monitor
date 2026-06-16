@@ -1208,16 +1208,7 @@ class StreamDownloaderGUI(QMainWindow):
             self.checker.terminate()
             self.checker.wait(2000)
 
-        self._running = False
-        for p in self.preview_worker._ffmpeg_processes:
-            try:
-                p.kill()
-            except Exception:
-                pass
-        self.preview_worker._running = False
-        if not self.preview_worker.wait(6000):
-            self.preview_worker.terminate()
-            self.preview_worker.wait(2000)
+        self.preview_worker.stop()
 
         self._proc_timer.stop()
         self._save()
