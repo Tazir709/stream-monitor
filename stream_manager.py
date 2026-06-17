@@ -11,6 +11,7 @@ from typing import Optional, Dict
 from datetime import datetime
 from queue import Queue, Empty
 from dataclasses import dataclass, field
+import traceback
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -80,6 +81,11 @@ def extract_username(url: str) -> str:
     return match.group(1) if match else url
 
 
+def log_exception(prefix: str) -> None:
+    print(f"[Debug] {prefix}")
+    traceback.print_exc()
+
+
 # ─────────────────────────────────────────────
 #  Preview worker
 # ─────────────────────────────────────────────
@@ -87,11 +93,12 @@ def extract_username(url: str) -> str:
 class SharedPreviewWorker(QThread):
     preview_updated = Signal(str, QPixmap)
 
-    CAPTURE_INTERVAL  = 90   # seconds between refreshes
-    HLS_CACHE_LIFETIME = 150  # seconds the HLS URL stays valid
+    CAPTURE_INTERVAL  = 90
+    HLS_CACHE_LIFETIME = 150
 
     def __init__(self):
         super().__init__()
+        self.setObjectName("SharedPreviewWorker")
         self._running = True
         self._lock = threading.Lock()
         self._live_urls: list[str] = []
@@ -102,6 +109,9 @@ class SharedPreviewWorker(QThread):
         self._current_status: dict[str, StreamStatus] = {}
         self._pending_captures: Queue = Queue()
         self._rate_limiter = RateLimiter(2.0)
+
+    def __del__(self):
+        print(f"[Debug] SharedPreviewWorker.__del__ called running={self.isRunning()}")
 
     # ── public API ──────────────────────────────
 
@@ -139,6 +149,7 @@ class SharedPreviewWorker(QThread):
                     pass
             self._ffmpeg_processes.clear()
         if not self.wait(6000):
+            print("[Debug] SharedPreviewWorker did not stop in time, terminating")
             self.terminate()
             self.wait(2000)
 
@@ -164,7 +175,7 @@ class SharedPreviewWorker(QThread):
                 self._stream_url_cache[page_url] = (url, time.time() + self.HLS_CACHE_LIFETIME)
                 return url
         except Exception:
-            pass
+            log_exception(f"PreviewWorker _get_stream_url failed for {page_url}")
         return None
 
     def _capture(self, page_url: str):
@@ -218,6 +229,7 @@ class SharedPreviewWorker(QThread):
                     if proc in self._ffmpeg_processes:
                         self._ffmpeg_processes.remove(proc)
         except Exception:
+            log_exception(f"PreviewWorker _capture failed for {page_url}")
             self._stream_url_cache.pop(page_url, None)
 
     def run(self):
@@ -225,39 +237,43 @@ class SharedPreviewWorker(QThread):
         last_capture: dict[str, float] = {}
 
         while self._running:
-            # Drain pending (immediate)
-            burst = 0
-            while burst < 3:
-                try:
-                    url = self._pending_captures.get_nowait()
-                    with self._lock:
-                        live = list(self._live_urls)
-                    if url in live:
-                        self._rate_limiter.wait_if_needed()
-                        self._capture(url)
-                        last_capture[url] = time.time()
-                    burst += 1
-                except Empty:
-                    break
+            try:
+                # Drain pending (immediate) captures first — but cap to avoid starvation
+                burst = 0
+                while burst < 3:
+                    try:
+                        url = self._pending_captures.get_nowait()
+                        with self._lock:
+                            live = list(self._live_urls)
+                        if url in live:
+                            self._rate_limiter.wait_if_needed()
+                            self._capture(url)
+                            last_capture[url] = time.time()
+                        burst += 1
+                    except Empty:
+                        break
 
-            # Scheduled round-robin
-            with self._lock:
-                urls = list(self._live_urls)
+                # Scheduled round-robin
+                with self._lock:
+                    urls = list(self._live_urls)
 
-            if not urls:
-                time.sleep(2)
-                continue
+                if not urls:
+                    time.sleep(2)
+                    continue
 
-            url = urls[index % len(urls)]
-            index = (index + 1) % max(len(urls), 1)
+                url = urls[index % len(urls)]
+                index = (index + 1) % max(len(urls), 1)
 
-            age = time.time() - last_capture.get(url, 0)
-            if age >= self.CAPTURE_INTERVAL:
-                self._rate_limiter.wait_if_needed()
-                self._capture(url)
-                last_capture[url] = time.time()
-            else:
-                time.sleep(min(2, self.CAPTURE_INTERVAL - age))
+                age = time.time() - last_capture.get(url, 0)
+                if age >= self.CAPTURE_INTERVAL:
+                    self._rate_limiter.wait_if_needed()
+                    self._capture(url)
+                    last_capture[url] = time.time()
+                else:
+                    time.sleep(min(2, self.CAPTURE_INTERVAL - age))
+            except Exception:
+                log_exception("PreviewWorker run loop failed")
+
 
 
 # ─────────────────────────────────────────────
@@ -270,7 +286,9 @@ class DownloadWorker(QThread):
     progress_signal   = Signal(str, int)   # (username, percent)
     resolution_signal = Signal(str, str)   # (url, "1920x1080")
 
-    # Lines from yt-dlp/ffmpeg output that are noisy but harmless — suppress them.
+    def __del__(self):
+        print(f"[Debug] DownloadWorker.__del__ called for username={getattr(self, 'username', '<unknown>')} running={self.isRunning()}")
+
     _NOISY_PATTERNS = (
         "error reading http response",
         "end of file",
@@ -284,6 +302,7 @@ class DownloadWorker(QThread):
 
     def __init__(self, stream_url: str, username: str, output_path: str = "downloads"):
         super().__init__()
+        self.setObjectName(f"DownloadWorker-{username}")
         self.stream_url  = stream_url
         self.username    = username
         self.output_path = output_path
@@ -318,7 +337,7 @@ class DownloadWorker(QThread):
             for line in iter(proc.stdout.readline, ""):
                 self._line_queue.put(line)
         except Exception:
-            pass
+            log_exception(f"DownloadWorker _drain_stdout failed for {self.username}")
         finally:
             self._line_queue.put(None)  # sentinel: EOF
 
@@ -403,6 +422,8 @@ class DownloadWorker(QThread):
 
         except Exception as e:
             self.log_signal.emit(self.username, f"❌ Error: {str(e)[:100]}")
+            print(f"[Debug] DownloadWorker run failed for {self.username}: {e!r}")
+            traceback.print_exc()
         finally:
             self.is_running = False
             self.finished_signal.emit(self.stream_url)
@@ -429,6 +450,8 @@ class DownloadWorker(QThread):
             pass
         except Exception as e:
             self.log_signal.emit(self.username, f"❌ Stop error: {str(e)[:80]}")
+            print(f"[Debug] DownloadWorker stop failed for {self.username}: {e!r}")
+            traceback.print_exc()
 
 
 # ─────────────────────────────────────────────
@@ -442,12 +465,17 @@ class StreamChecker(QThread):
 
     def __init__(self, ytdlp_path: str = "yt-dlp"):
         super().__init__()
+        self.setObjectName("StreamChecker")
         self._ytdlp   = ytdlp_path
         self._running = True
         self._rate_limiter = RateLimiter(2.0)
-
         self._lock: threading.Lock = threading.Lock()
         self._tracked: dict[str, float] = {}
+
+    def __del__(self):
+        print(f"[Debug] StreamChecker.__del__ called running={self.isRunning()}")
+
+    # ── public API ──────────────────────────────
 
     def add_stream(self, url: str, force: bool = False):
         with self._lock:
@@ -534,7 +562,8 @@ class StreamChecker(QThread):
         except subprocess.SubprocessError:
             return StreamStatus.ERROR, "❌ Process error"
         except Exception as e:
-            print(f"[Debug] Unexpected error: {e}")
+            print(f"[Debug] Unexpected error in StreamChecker._check for {url}: {e!r}")
+            traceback.print_exc()
             return StreamStatus.ERROR, "❌ Error"
 
 
@@ -685,11 +714,19 @@ class StreamDownloaderGUI(QMainWindow):
 
         # Workers
         self.preview_worker = SharedPreviewWorker()
+        self.preview_worker.setParent(self)
         self.preview_worker.preview_updated.connect(self._on_preview)
+        self.preview_worker.finished.connect(lambda: print("[Debug] SharedPreviewWorker finished"))
+        self.preview_worker.finished.connect(self.preview_worker.deleteLater)
+        self.preview_worker.destroyed.connect(lambda: print("[Debug] SharedPreviewWorker destroyed"))
         self.preview_worker.start()
 
         self.checker = StreamChecker()
+        self.checker.setParent(self)
         self.checker.status_signal.connect(self._on_status)
+        self.checker.finished.connect(lambda: print("[Debug] StreamChecker finished"))
+        self.checker.finished.connect(self.checker.deleteLater)
+        self.checker.destroyed.connect(lambda: print("[Debug] StreamChecker destroyed"))
         self.checker.start()
 
         self.download_workers: Dict[str, DownloadWorker] = {}
@@ -704,6 +741,8 @@ class StreamDownloaderGUI(QMainWindow):
         self._build_ui()
         self.setStyleSheet(DARK)
         self._load_saved_streams()
+
+        QApplication.instance().aboutToQuit.connect(self._shutdown_workers)
 
     # ── Persistence ─────────────────────────────
 
@@ -940,13 +979,14 @@ class StreamDownloaderGUI(QMainWindow):
             return
 
         worker = DownloadWorker(url, item.username, self._out_input.text().strip() or "downloads")
+        worker.setParent(self)
         worker.log_signal.connect(self._on_dl_log)
         worker.finished_signal.connect(self._on_dl_finished)
+        worker.finished.connect(worker.deleteLater)
         worker.progress_signal.connect(self._on_dl_progress)
         worker.resolution_signal.connect(self._on_resolution)
-        worker.start()
-
         self.download_workers[url] = worker
+        worker.start()
         item.download_active = True
         item.download_start_time = time.time()
 
@@ -1108,7 +1148,17 @@ class StreamDownloaderGUI(QMainWindow):
     # ── Helpers ─────────────────────────────────
 
     def _cleanup_download(self, url: str):
-        self.download_workers.pop(url, None)
+        worker = self.download_workers.get(url)
+        if worker:
+            print(f"[Debug] _cleanup_download: stopping worker {worker.objectName()}")
+            worker.stop()
+            if not worker.wait(5000):
+                print(f"[Debug] _cleanup_download: worker {worker.objectName()} did not exit in time, terminating")
+                worker.terminate()
+                worker.wait(2000)
+            worker.deleteLater()
+            self.download_workers.pop(url, None)
+        
         timer = self.download_timers.get(url)
         if timer:
             timer.stop_timer()
@@ -1175,6 +1225,45 @@ class StreamDownloaderGUI(QMainWindow):
         sb.setValue(sb.maximum())
         self._status_bar.showMessage(message, 3000)
 
+    def _shutdown_workers(self):
+        print("[Debug] _shutdown_workers: shutting down threads")
+
+        for url in list(self.download_workers.keys()):
+            worker = self.download_workers.get(url)
+            if worker:
+                print(f"[Debug] _shutdown_workers: stopping download worker {worker.objectName()} running={worker.isRunning()}")
+                worker.stop()
+        still_running = []
+        for url in list(self.download_workers.keys()):
+            worker = self.download_workers.get(url)
+            if worker and worker.isRunning():
+                print(f"[Debug] _shutdown_workers: waiting for download worker {worker.objectName()}")
+                if not worker.wait(5000):
+                    print(f"[Debug] _shutdown_workers: download worker {worker.objectName()} did not stop in time, terminating")
+                    worker.terminate()
+                    if not worker.wait(2000):
+                        print(f"[Debug] _shutdown_workers: download worker {worker.objectName()} still running after terminate")
+                        still_running.append(url)
+        if still_running:
+            print(f"[Debug] _shutdown_workers: preserving {len(still_running)} running DownloadWorker(s) to avoid QThread destructor warning: {still_running}")
+        self.download_workers = {url: w for url, w in self.download_workers.items() if url in still_running}
+
+        print(f"[Debug] _shutdown_workers: stopping checker {self.checker.objectName()} running={self.checker.isRunning()}")
+        self.checker.stop()
+        if self.checker.isRunning() and not self.checker.wait(5000):
+            print(f"[Debug] _shutdown_workers: StreamChecker did not stop in time, terminating")
+            self.checker.terminate()
+            if not self.checker.wait(2000):
+                print(f"[Debug] _shutdown_workers: StreamChecker still running after terminate")
+
+        print(f"[Debug] _shutdown_workers: stopping preview worker {self.preview_worker.objectName()} running={self.preview_worker.isRunning()}")
+        self.preview_worker.stop()
+        if self.preview_worker.isRunning() and not self.preview_worker.wait(5000):
+            print(f"[Debug] _shutdown_workers: SharedPreviewWorker did not stop in time, terminating")
+            self.preview_worker.terminate()
+            if not self.preview_worker.wait(2000):
+                print(f"[Debug] _shutdown_workers: SharedPreviewWorker still running after terminate")
+
     def closeEvent(self, event: QEvent):
         if self.download_workers:
             ans = QMessageBox.question(
@@ -1186,23 +1275,7 @@ class StreamDownloaderGUI(QMainWindow):
                 event.ignore()
                 return
 
-        for url in list(self.download_workers.keys()):
-            worker = self.download_workers.get(url)
-            if worker:
-                worker.stop()
-        for url in list(self.download_workers.keys()):
-            worker = self.download_workers.get(url)
-            if worker and worker.isRunning():
-                worker.wait(5000)
-        self.download_workers.clear()
-
-        self.checker.stop()
-        if not self.checker.wait(5000):
-            self.checker.terminate()
-            self.checker.wait(2000)
-
-        self.preview_worker.stop()
-
+        self._shutdown_workers()
         self._proc_timer.stop()
         self._save()
         event.accept()
