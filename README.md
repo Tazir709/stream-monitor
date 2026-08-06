@@ -4,6 +4,8 @@ A Python + PySide6 application for monitoring live streams, capturing previews, 
 
 The tool tracks multiple stream URLs, detects live status, shows real-time previews, and can automatically download active streams.
 
+[![Latest Release](https://img.shields.io/github/v/release/Tazir709/stream-monitor)](https://github.com/Tazir709/stream-monitor/releases/latest)
+
 ---
 ### Tested on:
 - Windows 10 / 11
