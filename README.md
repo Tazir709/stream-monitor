@@ -75,3 +75,15 @@ Supported browsers:
 
 - Session-based stream URLs may expire during long downloads
 - Some streams may appear “online” but still require authentication for download access
+
+## 📝 Changelog
+
+### (August 2026)
+- Added user-agent support for macOS compatibility
+- Improved filename format: `username YYYY-MM-DD HH_MM.mp4`
+- Smart fallback for resolution selection
+- Fixed "Requested format not available" errors
+- Added bandwidth & storage estimation for active downloads
+  - Shows total size per hour (MB/h or GB/h)
+  - Shows required internet speed (KB/s or MB/s)
+- Auto-download safeguard: streams under 5 minutes are automatically disabled
