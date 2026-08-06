@@ -84,6 +84,5 @@ Supported browsers:
 - Smart fallback for resolution selection
 - Fixed "Requested format not available" errors
 - Added bandwidth & storage estimation for active downloads
-  - Shows total size per hour (MB/h or GB/h)
-  - Shows required internet speed (KB/s or MB/s)
 - Auto-download safeguard: streams under 5 minutes are automatically disabled
+- Added tooltips and improved error messages
