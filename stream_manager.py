@@ -31,13 +31,14 @@ USE_COOKIES = False
 BROWSER = "firefox" # "chrome", "firefox", "edge", "opera", "brave", "vivaldi"
 USER_AGENT = "" # Optional user-agent string for yt-dlp. Leave empty to use default.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
-MAX_DOWNLOAD_FPS = 30 # 60, 30
-AUTO_DOWNLOAD_DISABLE_SECONDS = 600 # # Disable auto-download if the stream is shorter than this many seconds. 0 to disable
-DOWNLOAD_BITRATE_KBPS = {
+MAX_DOWNLOAD_FPS = 30 # 60 or 30
+AUTO_DOWNLOAD_DISABLE_SECONDS = 600 # Disable auto-download if the stream is shorter than this many seconds. 0 to disable
+DOWNLOAD_BITRATE_KBPS = { # Calculation based on 30 fps
     "640x360": 896,
     "960x540": 1696,
     "1280x720": 3096,
     "1920x1080": 5128,
+    "3840x2160": 7192,
 }
 
 
