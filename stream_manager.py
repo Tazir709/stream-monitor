@@ -139,6 +139,8 @@ def format_error_message(stderr: str, stdout: str = "") -> str:
         return "🚦 Rate limited. The tool is checking too frequently - wait a moment."
     if "ffmpeg" in text and "invalid data" in text:
         return "🎞️ Stream data error. The stream may have ended or changed format."
+    if "code 4294957242" in text or "code -10054" in text:
+        return "🌐 Network connection lost. The stream may have ended or your internet dropped."
     
     # Catch-all with a hint to check logs
     return f"❌ Operation failed: {stderr[:100].strip()}... (Check the log for details)"
