@@ -124,6 +124,26 @@ def log_exception(prefix: str) -> None:
     traceback.print_exc()
 
 
+def format_error_message(stderr: str, stdout: str = "") -> str:
+    text = f"{stderr}\n{stdout}".lower()
+    
+    if "403" in text or "forbidden" in text or "access denied" in text:
+        return "🚫 Access blocked (403). Try setting a User-Agent or enabling cookies."
+    if "private" in text or "age restricted" in text or "age-restricted" in text or "hidden session" in text:
+        return "🔒 Private or age-restricted stream. Enable cookies in config to access."
+    if "timed out" in text or "timeout" in text or "connection timed out" in text:
+        return "⏱️ Connection timed out. Check your internet and try again."
+    if "not found" in text or "video unavailable" in text or "unavailable" in text:
+        return "📦 Stream not found. The streamer may be offline or the URL may be incorrect."
+    if "rate limit" in text or "too many requests" in text:
+        return "🚦 Rate limited. The tool is checking too frequently - wait a moment."
+    if "ffmpeg" in text and "invalid data" in text:
+        return "🎞️ Stream data error. The stream may have ended or changed format."
+    
+    # Catch-all with a hint to check logs
+    return f"❌ Operation failed: {stderr[:100].strip()}... (Check the log for details)"
+
+
 # ─────────────────────────────────────────────
 #  Preview worker
 # ─────────────────────────────────────────────
@@ -215,6 +235,9 @@ class SharedPreviewWorker(QThread):
                 url = r.stdout.strip().split("\n")[0]
                 self._stream_url_cache[page_url] = (url, time.time() + self.HLS_CACHE_LIFETIME)
                 return url
+            if r.returncode != 0:
+                err = format_error_message(r.stderr, r.stdout)
+                print(f"[Debug] PreviewWorker _get_stream_url failed for {page_url}: {err}")
         except Exception:
             log_exception(f"PreviewWorker _get_stream_url failed for {page_url}")
         return None
@@ -379,6 +402,9 @@ class DownloadWorker(QThread):
                 res = r.stdout.strip().split("\n")[0]
                 if re.match(r"^\d+x\d+$", res):
                     return res
+            if r.returncode != 0:
+                err = format_error_message(r.stderr, r.stdout)
+                print(f"[Debug] DownloadWorker probe failed for {self.username}: {err}")
         except Exception:
             pass
         return ""
@@ -473,7 +499,8 @@ class DownloadWorker(QThread):
                             self.progress_signal.emit(self.username, int(float(m.group(1))))
                 elif any(k in line.lower() for k in ("error", "warning", "finished")):
                     if not any(n in line.lower() for n in self._NOISY_PATTERNS):
-                        self.log_signal.emit(self.username, line[:120])
+                        message = line[:120]
+                        self.log_signal.emit(self.username, message)
 
             try:
                 self.process.wait(timeout=10)
@@ -486,7 +513,8 @@ class DownloadWorker(QThread):
                     self.auto_download_disabled_signal.emit(self.stream_url)
 
         except Exception as e:
-            self.log_signal.emit(self.username, f"❌ Error: {str(e)[:100]}")
+            hint = format_error_message(str(e))
+            self.log_signal.emit(self.username, f"❌ Error: {str(e)[:100]} | {hint}")
             print(f"[Debug] DownloadWorker run failed for {self.username}: {e!r}")
             traceback.print_exc()
         finally:
@@ -613,8 +641,9 @@ class StreamChecker(QThread):
                     return StreamStatus.OFFLINE, "💤 Offline"
                 if "video unavailable" in stderr or "not found" in stderr:
                     return StreamStatus.OFFLINE, "💤 Stream not found"
-                print(f"[Debug] yt-dlp error for {url}: {stderr[:200]}")
-                return StreamStatus.ERROR, "❌ Error"
+                error_hint = format_error_message(stderr, stdout)
+                print(f"[Debug] yt-dlp error for {url}: {error_hint}")
+                return StreamStatus.ERROR, error_hint
 
             if stdout == "is_live":
                 return StreamStatus.ONLINE, "🟢 LIVE"
