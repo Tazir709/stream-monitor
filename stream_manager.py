@@ -28,7 +28,30 @@ from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 # ─────────────────────────────────────────────
 
 USE_COOKIES = False
-BROWSER = "firefox"
+BROWSER = "firefox" # "chrome", "firefox", "edge", "opera", "brave", "vivaldi"
+USER_AGENT = "" # Optional user-agent string for yt-dlp. Leave empty to use default.
+MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
+MAX_DOWNLOAD_FPS = 30 # 60, 30
+AUTO_DOWNLOAD_DISABLE_SECONDS = 600 # # Disable auto-download if the stream is shorter than this many seconds. 0 to disable
+DOWNLOAD_BITRATE_KBPS = {
+    "640x360": 896,
+    "960x540": 1696,
+    "1280x720": 3096,
+    "1920x1080": 5128,
+}
+
+
+def get_download_format_selector() -> str:
+    max_height = int(MAX_DOWNLOAD_RESOLUTION.split("x")[1])
+    return f"bestvideo[height<={max_height}][fps<={MAX_DOWNLOAD_FPS}]+bestaudio/best[height<={max_height}][fps<={MAX_DOWNLOAD_FPS}]/best"
+
+
+def get_user_agent() -> str:
+    return (USER_AGENT or "").strip()
+
+
+def should_disable_auto_download(duration_seconds: int) -> bool:
+    return duration_seconds < AUTO_DOWNLOAD_DISABLE_SECONDS
 
 
 # ─────────────────────────────────────────────
@@ -163,6 +186,9 @@ class SharedPreviewWorker(QThread):
                 return stream_url
         try:
             cmd = ["yt-dlp", "--get-url", "--no-playlist"]
+            user_agent = get_user_agent()
+            if user_agent:
+                cmd.extend(["--user-agent", user_agent])
             if USE_COOKIES:
                 cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(page_url)
@@ -190,9 +216,10 @@ class SharedPreviewWorker(QThread):
             referer = ""
 
         W, H = 320, 180
+        user_agent = get_user_agent() or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         cmd = [
             "ffmpeg",
-            "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-user_agent", user_agent,
             *([ "-headers", f"Referer: {referer}\r\n"] if referer else []),
             "-timeout", "10000000",
             "-i", stream_url,
@@ -281,10 +308,11 @@ class SharedPreviewWorker(QThread):
 # ─────────────────────────────────────────────
 
 class DownloadWorker(QThread):
-    log_signal        = Signal(str, str)   # (username, message)
-    finished_signal   = Signal(str)        # url
-    progress_signal   = Signal(str, int)   # (username, percent)
-    resolution_signal = Signal(str, str)   # (url, "1920x1080")
+    log_signal                = Signal(str, str)   # (username, message)
+    finished_signal           = Signal(str)        # url
+    progress_signal           = Signal(str, int)   # (username, percent)
+    resolution_signal         = Signal(str, str)   # (url, "1920x1080")
+    auto_download_disabled_signal = Signal(str)      # url
 
     def __del__(self):
         print(f"[Debug] DownloadWorker.__del__ called for username={getattr(self, 'username', '<unknown>')} running={self.isRunning()}")
@@ -310,12 +338,21 @@ class DownloadWorker(QThread):
         self.is_running  = False
         self._rate_limiter = RateLimiter(2.0)
         self._line_queue: Queue = Queue()
+        self._started_at = 0.0
         os.makedirs(output_path, exist_ok=True)
 
     def _probe_resolution(self) -> str:
         """Ask yt-dlp for the selected format's resolution before starting the download."""
         try:
-            cmd = ["yt-dlp", "--no-playlist", "--print", "%(width)sx%(height)s"]
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "--format", get_download_format_selector(),
+                "--print", "%(width)sx%(height)s",
+            ]
+            user_agent = get_user_agent()
+            if user_agent:
+                cmd.extend(["--user-agent", user_agent])
             if USE_COOKIES:
                 cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(self.stream_url)
@@ -354,9 +391,12 @@ class DownloadWorker(QThread):
                 self.log_signal.emit(self.username, "📐 Resolution unknown")
                 self.resolution_signal.emit(self.stream_url, "")
 
+            self._started_at = time.time()
+
             cmd = [
                 "yt-dlp",
                 "--no-simulate",
+                "--format", get_download_format_selector(),
                 "-o", os.path.join(
                     self.output_path,
                     "%(uploader)s_%(title)s_%(id)s_%(timestamp)s.%(ext)s"
@@ -366,6 +406,9 @@ class DownloadWorker(QThread):
                 "--limit-rate", "2M",
                 "--no-live-from-start",
             ]
+            user_agent = get_user_agent()
+            if user_agent:
+                cmd.extend(["--user-agent", user_agent])
             if USE_COOKIES:
                 cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(self.stream_url)
@@ -419,6 +462,11 @@ class DownloadWorker(QThread):
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
+
+            if self._started_at:
+                elapsed = int(time.time() - self._started_at)
+                if should_disable_auto_download(elapsed):
+                    self.auto_download_disabled_signal.emit(self.stream_url)
 
         except Exception as e:
             self.log_signal.emit(self.username, f"❌ Error: {str(e)[:100]}")
@@ -522,6 +570,9 @@ class StreamChecker(QThread):
         self._rate_limiter.wait_if_needed()
         try:
             cmd = [self._ytdlp, "--simulate", "--print", "%(live_status)s"]
+            user_agent = get_user_agent()
+            if user_agent:
+                cmd.extend(["--user-agent", user_agent])
             if USE_COOKIES:
                 cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(url)
@@ -684,7 +735,11 @@ def load_saved_streams() -> list[dict]:
             data = json.load(f)
         if isinstance(data, list):
             return [
-                {"url": e["url"], "auto_start": bool(e.get("auto_start", False))}
+                {
+                    "url": e["url"],
+                    "auto_start": bool(e.get("auto_start", False)),
+                    "user_agent": e.get("user_agent", ""),
+                }
                 for e in data
                 if isinstance(e, dict) and e.get("url")
             ]
@@ -695,7 +750,7 @@ def load_saved_streams() -> list[dict]:
 
 def save_streams(stream_items: dict) -> None:
     payload = [
-        {"url": item.url, "auto_start": item.auto_start}
+        {"url": item.url, "auto_start": item.auto_start, "user_agent": USER_AGENT}
         for item in stream_items.values()
     ]
     try:
@@ -732,6 +787,7 @@ class StreamDownloaderGUI(QMainWindow):
         self.download_workers: Dict[str, DownloadWorker] = {}
         self.download_timers: Dict[str, DownloadTimer]   = {}
         self.stream_items: Dict[str, StreamItem]         = {}
+        self.auto_checkboxes: Dict[str, QCheckBox] = {}
 
         # Process health check
         self._proc_timer = QTimer(self)
@@ -750,6 +806,12 @@ class StreamDownloaderGUI(QMainWindow):
         saved = load_saved_streams()
         if not saved:
             return
+        if saved:
+            global USER_AGENT
+            user_agent = saved[0].get("user_agent", "") if saved else ""
+            USER_AGENT = user_agent
+            if self._user_agent_input:
+                self._user_agent_input.setText(USER_AGENT)
         for entry in saved:
             url = entry["url"]
             auto = entry["auto_start"]
@@ -759,6 +821,10 @@ class StreamDownloaderGUI(QMainWindow):
 
     def _save(self):
         save_streams(self.stream_items)
+
+    def _on_user_agent_changed(self, text: str):
+        global USER_AGENT
+        USER_AGENT = text.strip()
 
     # ── UI construction ─────────────────────────
 
@@ -781,6 +847,12 @@ class StreamDownloaderGUI(QMainWindow):
         self._out_input = QLineEdit("downloads")
         self._out_input.setPlaceholderText("Output folder")
         bar.addWidget(self._out_input, 1)
+
+        self._user_agent_input = QLineEdit()
+        self._user_agent_input.setPlaceholderText("Optional User-Agent")
+        self._user_agent_input.setText(USER_AGENT)
+        self._user_agent_input.textChanged.connect(self._on_user_agent_changed)
+        bar.addWidget(self._user_agent_input, 2)
 
         add_btn = QPushButton("＋  Add Stream")
         add_btn.setObjectName("addBtn")
@@ -852,10 +924,18 @@ class StreamDownloaderGUI(QMainWindow):
         splitter.setStretchFactor(1, 1)
         vbox.addWidget(splitter)
 
+        self._download_info_label = QLabel("Download info: idle")
+        self._download_info_label.setObjectName("sectionLabel")
+        self._download_info_label.setStyleSheet(
+            "font-size:11px; color:#8fb3ff; padding:4px 0 0 0;"
+        )
+        vbox.addWidget(self._download_info_label)
+
         # Status bar
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Ready")
+        self._update_download_info()
 
     # ── Stream management ───────────────────────
 
@@ -917,6 +997,7 @@ class StreamDownloaderGUI(QMainWindow):
         auto_cb.setChecked(auto_start)
         auto_cb.setToolTip("Auto-start when stream goes live")
         auto_cb.stateChanged.connect(lambda s, u=url: self._toggle_auto(u, bool(s)))
+        self.auto_checkboxes[url] = auto_cb
         cb_wrap = QWidget()
         cb_lay = QHBoxLayout(cb_wrap)
         cb_lay.addWidget(auto_cb)
@@ -985,6 +1066,7 @@ class StreamDownloaderGUI(QMainWindow):
         worker.finished.connect(worker.deleteLater)
         worker.progress_signal.connect(self._on_dl_progress)
         worker.resolution_signal.connect(self._on_resolution)
+        worker.auto_download_disabled_signal.connect(self._on_auto_download_disabled)
         self.download_workers[url] = worker
         worker.start()
         item.download_active = True
@@ -995,6 +1077,7 @@ class StreamDownloaderGUI(QMainWindow):
             timer.start_timer()
 
         self._update_dl_ui(url, True)
+        self._update_download_info()
         self._log_msg(f"🚀 Started: {item.username}", "#4CAF50")
 
     def _stop_download(self, url: str):
@@ -1031,6 +1114,7 @@ class StreamDownloaderGUI(QMainWindow):
         self._table.removeRow(row)
 
         self.download_timers.pop(url, None)
+        self.auto_checkboxes.pop(url, None)
         del self.stream_items[url]
 
         for u, si in self.stream_items.items():
@@ -1123,12 +1207,28 @@ class StreamDownloaderGUI(QMainWindow):
                 res_lbl.setStyleSheet(
                     "font-size:11px; color:#555; font-family:'Courier New',monospace;"
                 )
+        self._update_download_info()
 
     def _on_dl_log(self, username: str, message: str):
         self._log_msg(f"[{username}] {message}", "#5b9bd5")
 
     def _on_dl_progress(self, username: str, percent: int):
         self._status_bar.showMessage(f"{username}: {percent}%", 1500)
+
+    def _on_auto_download_disabled(self, url: str):
+        item = self.stream_items.get(url)
+        if not item:
+            return
+        if item.auto_start:
+            item.auto_start = False
+            self._save()
+            cb = self.auto_checkboxes.get(url)
+            if cb:
+                cb.setChecked(False)
+            self._log_msg(
+                f"⚠ Auto-start disabled for {item.username}: download stopped before 10 minutes",
+                "#FF9800"
+            )
 
     def _on_dl_finished(self, url: str):
         item = self.stream_items.get(url)
@@ -1167,6 +1267,58 @@ class StreamDownloaderGUI(QMainWindow):
             item.download_active = False
             item.download_start_time = 0
             self._update_dl_ui(url, False)
+        self._update_download_info()
+
+    def _format_size(self, bytes_value: float) -> str:
+        if bytes_value >= 1024 * 1024 * 1024:
+            return f"{bytes_value / (1024 * 1024 * 1024):.2f} GB"
+        if bytes_value >= 1024 * 1024:
+            return f"{bytes_value / (1024 * 1024):.2f} MB"
+        if bytes_value >= 1024:
+            return f"{bytes_value / 1024:.2f} KB"
+        return f"{bytes_value:.0f} B"
+
+    def _estimate_download_info(self) -> tuple[str, float, float]:
+        active_items = [item for item in self.stream_items.values() if item.download_active]
+        if not active_items:
+            return "No active downloads", 0.0, 0.0
+
+        total_mbps = 0.0
+        details: list[str] = []
+        for item in active_items:
+            resolution = item.resolution or ""
+            kbps = DOWNLOAD_BITRATE_KBPS.get(resolution, 0)
+            if kbps <= 0:
+                details.append(f"{item.username}: unknown")
+                continue
+            mbps = kbps / 1000.0
+            total_mbps += mbps
+            size_per_hour_mb = mbps * 3600 / 8.0
+            if size_per_hour_mb >= 1024:
+                size_label = f"{size_per_hour_mb / 1024:.2f} GB/h"
+            else:
+                size_label = f"{size_per_hour_mb:.2f} MB/h"
+            details.append(f"{item.username}: {resolution} → {size_label}")
+
+        total_per_hour_mb = total_mbps * 3600 / 8.0
+        if total_per_hour_mb >= 1024:
+            total_label = f"{total_per_hour_mb / 1024:.2f} GB/h"
+        else:
+            total_label = f"{total_per_hour_mb:.2f} MB/h"
+
+        required_speed_mb_s = total_mbps / 8.0
+        if required_speed_mb_s >= 1:
+            speed_label = f"{required_speed_mb_s:.2f} MB/s"
+        else:
+            speed_label = f"{required_speed_mb_s * 1024:.2f} KB/s"
+
+        summary = f"{len(active_items)} active • total {total_label} • needed {speed_label}"
+        return summary, total_per_hour_mb, required_speed_mb_s
+
+    def _update_download_info(self):
+        summary, _, _ = self._estimate_download_info()
+        if self._download_info_label:
+            self._download_info_label.setText(f"Download info: {summary}")
 
     def _update_dl_ui(self, url: str, active: bool):
         item = self.stream_items.get(url)
