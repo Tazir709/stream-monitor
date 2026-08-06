@@ -32,7 +32,7 @@ BROWSER = "firefox" # "chrome", "firefox", "edge", "opera", "brave", "vivaldi"
 USER_AGENT = "" # Optional user-agent string for yt-dlp. Leave empty to use default.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
-AUTO_DOWNLOAD_DISABLE_SECONDS = 600 # Disable auto-download if the stream is shorter than this many seconds. 0 to disable
+AUTO_DOWNLOAD_DISABLE_SECONDS = 300 # Disable auto-download if the stream is shorter than this many seconds. 0 to disable
 DOWNLOAD_BITRATE_KBPS = { # Calculation based on 30 fps
     "640x360": 896,
     "960x540": 1696,
@@ -44,7 +44,21 @@ DOWNLOAD_BITRATE_KBPS = { # Calculation based on 30 fps
 
 def get_download_format_selector() -> str:
     max_height = int(MAX_DOWNLOAD_RESOLUTION.split("x")[1])
-    return f"bestvideo[height<={max_height}][fps<={MAX_DOWNLOAD_FPS}]+bestaudio/best[height<={max_height}][fps<={MAX_DOWNLOAD_FPS}]/best"
+    max_fps = MAX_DOWNLOAD_FPS
+    
+    # Build a format selector with multiple fallback levels
+    return (
+        # Level 1: Exact match (preferred resolution + FPS)
+        f"bestvideo[height<={max_height}][fps<={max_fps}]+bestaudio/"
+        # Level 2: Same resolution, any FPS (if FPS is too high, just take what's available)
+        f"bestvideo[height<={max_height}]+bestaudio/"
+        # Level 3: Lower resolution, same FPS
+        f"bestvideo[fps<={max_fps}]+bestaudio/"
+        # Level 4: Anything goes (best available)
+        f"bestvideo+bestaudio/"
+        # Level 5: Ultimate fallback (if everything else fails)
+        f"best"
+    )
 
 
 def get_user_agent() -> str:
@@ -394,13 +408,15 @@ class DownloadWorker(QThread):
 
             self._started_at = time.time()
 
+            current_time = datetime.now().strftime("%Y-%m-%d %H_%M")
+
             cmd = [
                 "yt-dlp",
                 "--no-simulate",
                 "--format", get_download_format_selector(),
                 "-o", os.path.join(
                     self.output_path,
-                    "%(uploader)s_%(title)s_%(id)s_%(timestamp)s.%(ext)s"
+                    f"{self.username} {current_time}.%(ext)s"
                 ),
                 "--no-overwrites", "--continue", "--no-part",
                 "--skip-unavailable-fragments", "--hls-use-mpegts",
