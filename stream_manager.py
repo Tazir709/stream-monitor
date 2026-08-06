@@ -954,6 +954,13 @@ class StreamDownloaderGUI(QMainWindow):
         self._status_bar.showMessage("Ready")
         self._update_download_info()
 
+        # Tooltips
+        self._url_input.setToolTip("Enter a Chaturbate stream URL\nExample: https://chaturbate.com/username/")
+        self._out_input.setToolTip("Folder where downloads will be saved")
+        self._user_agent_input.setToolTip("Optional: Override the default user-agent\nUseful for macOS users getting 403 errors")
+        add_btn.setToolTip("Add the stream to the monitoring list")
+        stop_all_btn.setToolTip("Stop ALL active downloads immediately")
+
     # ── Stream management ───────────────────────
 
     def _add_stream(self, url: str = "", auto_start: bool = False, silent: bool = False):
@@ -1012,7 +1019,7 @@ class StreamDownloaderGUI(QMainWindow):
         # Col 5 — auto-start
         auto_cb = QCheckBox()
         auto_cb.setChecked(auto_start)
-        auto_cb.setToolTip("Auto-start when stream goes live")
+        auto_cb.setToolTip("Automatically start downloading when this stream goes live")
         auto_cb.stateChanged.connect(lambda s, u=url: self._toggle_auto(u, bool(s)))
         self.auto_checkboxes[url] = auto_cb
         cb_wrap = QWidget()
@@ -1031,6 +1038,7 @@ class StreamDownloaderGUI(QMainWindow):
         # Col 7 — Start
         start_btn = QPushButton("▶ Start")
         start_btn.setObjectName("startBtn")
+        start_btn.setToolTip("Manually start downloading this stream now")
         start_btn.clicked.connect(lambda _, u=url: self._manual_start(u))
         self._table.setCellWidget(row, 7, start_btn)
 
@@ -1038,13 +1046,14 @@ class StreamDownloaderGUI(QMainWindow):
         stop_btn = QPushButton("⏹ Stop")
         stop_btn.setObjectName("stopBtn")
         stop_btn.setEnabled(False)
+        stop_btn.setToolTip("Stop the current download for this stream")
         stop_btn.clicked.connect(lambda _, u=url: self._stop_download(u))
         self._table.setCellWidget(row, 8, stop_btn)
 
         # Col 9 — Remove
         rm_btn = QPushButton("Remove")
         rm_btn.setObjectName("removeBtn")
-        rm_btn.setToolTip("Remove stream")
+        rm_btn.setToolTip("Remove this stream from the list")
         rm_btn.clicked.connect(lambda _, u=url: self._remove_stream(u))
         self._table.setCellWidget(row, 9, rm_btn)
 
