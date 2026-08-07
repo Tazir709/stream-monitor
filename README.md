@@ -81,10 +81,9 @@ Supported browsers:
 ## 📝 Changelog
 
 ### (August 2026)
-- Added user-agent support for macOS compatibility
+- Added user-agent support for macOS compatibility (improves compatibility with some platforms)
 - Improved filename format: `username YYYY-MM-DD HH_MM.mp4`
-- Smart fallback for resolution selection
-- Fixed "Requested format not available" errors
-- Added bandwidth & storage estimation for active downloads
-- Auto-download safeguard: streams under 5 minutes are automatically disabled
-- Added tooltips and improved error messages
+- Added smart fallback for resolution selection when preferred formats are unavailable
+- Added adaptive stream checking: offline streams now use gradually longer check intervals to reduce unnecessary requests while still detecting new streams quickly
+- Added auto-download protection: streams that repeatedly produce very short downloads are temporarily disabled to prevent restart loops
+- Improved error handling and user feedback throughout the application
