@@ -129,11 +129,11 @@ def format_error_message(stderr: str, stdout: str = "") -> str:
     
     if "403" in text or "forbidden" in text or "access denied" in text:
         return "🚫 Access blocked (403). Try setting a User-Agent or enabling cookies."
-    if "private" in text or "age restricted" in text or "age-restricted" in text or "hidden session" in text:
-        return "🔒 Private or age-restricted stream. Enable cookies in config to access."
+    if "age restricted" in text or "age-restricted" in text:
+        return "🔒 Age-restricted stream. Enable cookies in config to access."
     if "timed out" in text or "timeout" in text or "connection timed out" in text:
         return "⏱️ Connection timed out. Check your internet and try again."
-    if "not found" in text or "video unavailable" in text or "unavailable" in text:
+    if "video unavailable" in text or "not found" in text:
         return "📦 Stream not found. The streamer may be offline or the URL may be incorrect."
     if "rate limit" in text or "too many requests" in text:
         return "🚦 Rate limited. The tool is checking too frequently - wait a moment."
@@ -141,9 +141,10 @@ def format_error_message(stderr: str, stdout: str = "") -> str:
         return "🎞️ Stream data error. The stream may have ended or changed format."
     if "code 4294957242" in text or "code -10054" in text:
         return "🌐 Network connection lost. The stream may have ended or your internet dropped."
-    
+
     # Catch-all with a hint to check logs
-    return f"❌ Operation failed: {stderr[:100].strip()}... (Check the log for details)"
+    clean_error = stderr.replace("\n", " ").strip()[:100]
+    return f"❌ Operation failed: {clean_error}... (Check the log for details)"
 
 
 # ─────────────────────────────────────────────
