@@ -32,8 +32,13 @@ BROWSER = "firefox" # "chrome", "firefox", "edge", "opera", "brave", "vivaldi"
 USER_AGENT = "" # Optional user-agent string for yt-dlp. Leave empty to use default.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
+
+# Prevents unstable streams from continuously rejoining the download queue
+# when the system is under heavy load. Prioritizing fewer stable downloads
+# is preferable to having many unstable downloads repeatedly stopping and restarting.
 AUTO_DOWNLOAD_DISABLE_SECONDS = 300 # Disable auto-download if the stream is shorter than this many seconds. 0 to disable
-DOWNLOAD_BITRATE_KBPS = { # Calculation based on 30 fps
+
+DOWNLOAD_BITRATE_KBPS = { # Usage calculation based on 30 fps
     "640x360": 896,
     "960x540": 1696,
     "1280x720": 3096,
@@ -558,6 +563,8 @@ class StreamChecker(QThread):
     status_signal = Signal(str, object, str)  # (url, StreamStatus, message)
 
     CHECK_INTERVAL = 90
+    BACKOFF_STEP = 30
+    MAX_CHECK_INTERVAL = 300
 
     def __init__(self, ytdlp_path: str = "yt-dlp"):
         super().__init__()
@@ -567,6 +574,7 @@ class StreamChecker(QThread):
         self._rate_limiter = RateLimiter(2.0)
         self._lock: threading.Lock = threading.Lock()
         self._tracked: dict[str, float] = {}
+        self._check_intervals: dict[str, float] = {}
 
     def __del__(self):
         print(f"[Debug] StreamChecker.__del__ called running={self.isRunning()}")
@@ -577,16 +585,19 @@ class StreamChecker(QThread):
         with self._lock:
             if force or url not in self._tracked:
                 self._tracked[url] = 0.0
+                self._check_intervals[url] = self.CHECK_INTERVAL
 
     def remove_stream(self, url: str):
         with self._lock:
             self._tracked.pop(url, None)
+            self._check_intervals.pop(url, None)
 
     def force_check(self, url: str):
         """Reset timestamp so the URL is checked on the next loop tick."""
         with self._lock:
             if url in self._tracked:
                 self._tracked[url] = 0.0
+                self._check_intervals[url] = self.CHECK_INTERVAL
 
     def stop(self):
         self._running = False
@@ -600,7 +611,7 @@ class StreamChecker(QThread):
             with self._lock:
                 due = [
                     url for url, last in self._tracked.items()
-                    if now - last >= self.CHECK_INTERVAL
+                    if now - last >= self._check_intervals.get(url, self.CHECK_INTERVAL)
                 ]
 
             for url in due:
@@ -610,6 +621,11 @@ class StreamChecker(QThread):
                 with self._lock:
                     if url in self._tracked:
                         self._tracked[url] = time.time()
+                        if status == StreamStatus.ONLINE:
+                            self._check_intervals[url] = self.CHECK_INTERVAL
+                        elif status == StreamStatus.OFFLINE:
+                            current = self._check_intervals.get(url, self.CHECK_INTERVAL)
+                            self._check_intervals[url] = min(current + self.BACKOFF_STEP, self.MAX_CHECK_INTERVAL)
                 self.status_signal.emit(url, status, message)
 
             time.sleep(1)
