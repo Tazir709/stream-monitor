@@ -6,6 +6,7 @@ import re
 import os
 import sys
 import json
+import shutil
 from enum import Enum
 from typing import Optional, Dict
 from datetime import datetime
@@ -17,7 +18,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QLabel, QPushButton, QLineEdit,
     QTextEdit, QCheckBox, QStatusBar, QMessageBox, QHeaderView,
-    QSplitter, QFrame, QSizePolicy
+    QSplitter, QFrame, QSizePolicy, QDialog, QFileDialog, QComboBox,
+    QFormLayout, QDialogButtonBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize
 from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
@@ -27,9 +29,10 @@ from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 #  Configuration
 # ─────────────────────────────────────────────
 
-USE_COOKIES = False
-BROWSER = "firefox" # "chrome", "firefox", "edge", "opera", "brave", "vivaldi"
-USER_AGENT = "" # Optional user-agent string for yt-dlp. Leave empty to use default.
+USE_COOKIES = True
+BROWSER = ""
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0" # Optional user-agent string for yt-dlp. Leave empty to use default.
+DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the Settings dialog; persisted across sessions.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
 
@@ -72,6 +75,31 @@ def get_user_agent() -> str:
 
 def should_disable_auto_download(duration_seconds: int) -> bool:
     return duration_seconds < AUTO_DOWNLOAD_DISABLE_SECONDS
+
+
+def _find_tool(name: str) -> str:
+    """Resolve an external tool (yt-dlp, ffmpeg), preferring a copy
+    installed in the venv this app is actually running from — via
+    sys.prefix, so it works whether that venv was "activated" or its
+    Python was invoked directly, without needing to know the venv's
+    folder name in advance. Falls back to PATH if not found there.
+
+    This matters specifically because the app calls these tools by bare
+    name in subprocess calls, which only resolves via PATH — a venv-only
+    pip install of yt-dlp does nothing unless that venv's bin folder is
+    on PATH, which isn't guaranteed for a GUI app people often launch by
+    double-click rather than from an activated terminal.
+    """
+    exe_name = f"{name}.exe" if sys.platform == "win32" else name
+    venv_bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+    venv_path = os.path.join(sys.prefix, venv_bin_dir, exe_name)
+    if os.path.isfile(venv_path):
+        return venv_path
+    return shutil.which(name) or name
+
+
+YTDLP_PATH = _find_tool("yt-dlp")
+FFMPEG_PATH = _find_tool("ffmpeg")
 
 
 # ─────────────────────────────────────────────
@@ -176,9 +204,6 @@ class SharedPreviewWorker(QThread):
         self._pending_captures: Queue = Queue()
         self._rate_limiter = RateLimiter(2.0)
 
-    def __del__(self):
-        print(f"[Debug] SharedPreviewWorker.__del__ called running={self.isRunning()}")
-
     # ── public API ──────────────────────────────
 
     def update_status(self, url: str, status: StreamStatus):
@@ -228,7 +253,7 @@ class SharedPreviewWorker(QThread):
             if time.time() < expiry:
                 return stream_url
         try:
-            cmd = ["yt-dlp", "--get-url", "--no-playlist"]
+            cmd = [YTDLP_PATH, "--get-url", "--no-playlist"]
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
@@ -264,7 +289,7 @@ class SharedPreviewWorker(QThread):
         W, H = 320, 180
         user_agent = get_user_agent() or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         cmd = [
-            "ffmpeg",
+            FFMPEG_PATH,
             "-user_agent", user_agent,
             *([ "-headers", f"Referer: {referer}\r\n"] if referer else []),
             "-timeout", "10000000",
@@ -360,9 +385,6 @@ class DownloadWorker(QThread):
     resolution_signal         = Signal(str, str)   # (url, "1920x1080")
     auto_download_disabled_signal = Signal(str)      # url
 
-    def __del__(self):
-        print(f"[Debug] DownloadWorker.__del__ called for username={getattr(self, 'username', '<unknown>')} running={self.isRunning()}")
-
     _NOISY_PATTERNS = (
         "error reading http response",
         "end of file",
@@ -374,7 +396,7 @@ class DownloadWorker(QThread):
         "[in#",           # ffmpeg demuxer keepalive noise, e.g. "[in#0/hls @ ...]"
     )
 
-    def __init__(self, stream_url: str, username: str, output_path: str = "downloads"):
+    def __init__(self, stream_url: str, username: str, output_path: str = "Downloads"):
         super().__init__()
         self.setObjectName(f"DownloadWorker-{username}")
         self.stream_url  = stream_url
@@ -391,7 +413,7 @@ class DownloadWorker(QThread):
         """Ask yt-dlp for the selected format's resolution before starting the download."""
         try:
             cmd = [
-                "yt-dlp",
+                YTDLP_PATH,
                 "--no-playlist",
                 "--format", get_download_format_selector(),
                 "--print", "%(width)sx%(height)s",
@@ -445,7 +467,7 @@ class DownloadWorker(QThread):
             current_time = datetime.now().strftime("%Y-%m-%d %H_%M")
 
             cmd = [
-                "yt-dlp",
+                YTDLP_PATH,
                 "--no-simulate",
                 "--format", get_download_format_selector(),
                 "-o", os.path.join(
@@ -566,7 +588,7 @@ class StreamChecker(QThread):
     BACKOFF_STEP = 30
     MAX_CHECK_INTERVAL = 300
 
-    def __init__(self, ytdlp_path: str = "yt-dlp"):
+    def __init__(self, ytdlp_path: str = YTDLP_PATH):
         super().__init__()
         self.setObjectName("StreamChecker")
         self._ytdlp   = ytdlp_path
@@ -575,9 +597,6 @@ class StreamChecker(QThread):
         self._lock: threading.Lock = threading.Lock()
         self._tracked: dict[str, float] = {}
         self._check_intervals: dict[str, float] = {}
-
-    def __del__(self):
-        print(f"[Debug] StreamChecker.__del__ called running={self.isRunning()}")
 
     # ── public API ──────────────────────────────
 
@@ -804,6 +823,9 @@ def load_saved_streams() -> list[dict]:
                     "url": e["url"],
                     "auto_start": bool(e.get("auto_start", False)),
                     "user_agent": e.get("user_agent", ""),
+                    "output_folder": e.get("output_folder", ""),
+                    "max_resolution": e.get("max_resolution", ""),
+                    "max_fps": e.get("max_fps", ""),
                 }
                 for e in data
                 if isinstance(e, dict) and e.get("url")
@@ -815,7 +837,14 @@ def load_saved_streams() -> list[dict]:
 
 def save_streams(stream_items: dict) -> None:
     payload = [
-        {"url": item.url, "auto_start": item.auto_start, "user_agent": USER_AGENT}
+        {
+            "url": item.url,
+            "auto_start": item.auto_start,
+            "user_agent": USER_AGENT,
+            "output_folder": DOWNLOAD_OUTPUT,
+            "max_resolution": MAX_DOWNLOAD_RESOLUTION,
+            "max_fps": MAX_DOWNLOAD_FPS,
+        }
         for item in stream_items.values()
     ]
     try:
@@ -823,6 +852,149 @@ def save_streams(stream_items: dict) -> None:
             json.dump(payload, f, indent=2)
     except OSError:
         pass
+
+
+# ─────────────────────────────────────────────
+#  Settings dialog
+# ─────────────────────────────────────────────
+
+_BROWSER_CHOICES = ["firefox", "chrome", "chromium", "edge", "brave", "opera", "safari"]
+_RESOLUTION_CHOICES = ["640x360", "960x540", "1280x720", "1920x1080", "3840x2160"]
+_FPS_CHOICES = ["30", "60"]
+
+
+class SettingsDialog(QDialog):
+    """Setup-once config — output folder, cookies, User-Agent — lives here
+    instead of the main toolbar, so day-to-day use (paste a URL, go) stays
+    uncluttered."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(480)
+
+        form = QFormLayout(self)
+
+        # ── Download output ──
+        self.out_input = QLineEdit(DOWNLOAD_OUTPUT)
+        self.out_input.setToolTip("Folder where downloads will be saved")
+        out_browse = QPushButton("Browse…")
+        out_browse.clicked.connect(self._browse_output)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.out_input)
+        out_row.addWidget(out_browse)
+        form.addRow("Download output:", out_row)
+
+        # ── Video quality ──
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItems(_RESOLUTION_CHOICES)
+        self.fps_combo = QComboBox()
+        self.fps_combo.addItems(_FPS_CHOICES)
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(self.resolution_combo)
+        quality_row.addWidget(QLabel("max,"))
+        quality_row.addWidget(self.fps_combo)
+        quality_row.addWidget(QLabel("fps max"))
+        quality_row.addStretch(1)
+        form.addRow("Video quality:", quality_row)
+
+        # ── Cookies (always on — no toggle, just where to read them from) ──
+        self.browser_combo = QComboBox()
+        self.browser_combo.addItems(_BROWSER_CHOICES)
+        self.cookie_path_input = QLineEdit()
+        self.cookie_path_input.setPlaceholderText("Profile folder (leave blank for the default profile)")
+        cookie_browse = QPushButton("Browse…")
+        cookie_browse.clicked.connect(self._browse_cookies)
+        cookie_row = QHBoxLayout()
+        cookie_row.addWidget(self.browser_combo)
+        cookie_row.addWidget(self.cookie_path_input, 1)
+        cookie_row.addWidget(cookie_browse)
+        form.addRow("Cookie source:", cookie_row)
+
+        cookie_hint = QLabel(
+            "Cookies are always used — most streams need them now. Pick which browser,\n"
+            "and if it's a Firefox-based browser not in the list (Floorp, Zen, LibreWolf…),\n"
+            "browse to its profile folder directly."
+        )
+        cookie_hint.setStyleSheet("color: #888; font-size: 11px;")
+        form.addRow("", cookie_hint)
+
+        # ── User-Agent ──
+        self.user_agent_input = QLineEdit()
+        self.user_agent_input.setPlaceholderText("e.g. Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...")
+        form.addRow("User-Agent:", self.user_agent_input)
+
+        ua_hint = QLabel(
+            "Often needed to get past Cloudflare's Turnstile check. Find yours by searching\n"
+            "\"what is my user agent\", or visit whatsmyua.info — use the same browser your\n"
+            "cookies came from."
+        )
+        ua_hint.setStyleSheet("color: #888; font-size: 11px;")
+        form.addRow("", ua_hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.close)
+        buttons.accepted.connect(self.close)
+        form.addRow(buttons)
+
+        self._load_from_globals()
+
+        # Live-apply on change, same pattern the rest of the app already uses
+        self.out_input.textChanged.connect(self._on_output_changed)
+        self.resolution_combo.currentTextChanged.connect(self._on_resolution_changed)
+        self.fps_combo.currentTextChanged.connect(self._on_fps_changed)
+        self.browser_combo.currentTextChanged.connect(self._on_cookie_source_changed)
+        self.cookie_path_input.textChanged.connect(self._on_cookie_source_changed)
+        self.user_agent_input.textChanged.connect(self._on_user_agent_changed)
+
+    def _load_from_globals(self):
+        self.out_input.setText(DOWNLOAD_OUTPUT)
+        if MAX_DOWNLOAD_RESOLUTION in _RESOLUTION_CHOICES:
+            self.resolution_combo.setCurrentText(MAX_DOWNLOAD_RESOLUTION)
+        if str(MAX_DOWNLOAD_FPS) in _FPS_CHOICES:
+            self.fps_combo.setCurrentText(str(MAX_DOWNLOAD_FPS))
+        self.user_agent_input.setText(USER_AGENT)
+        browser, _, path = BROWSER.partition(":")
+        if browser in _BROWSER_CHOICES:
+            self.browser_combo.setCurrentText(browser)
+        self.cookie_path_input.setText(path)
+
+    def _on_output_changed(self, text: str):
+        global DOWNLOAD_OUTPUT
+        DOWNLOAD_OUTPUT = text.strip() or "Downloads"
+
+    def _on_resolution_changed(self, text: str):
+        global MAX_DOWNLOAD_RESOLUTION
+        MAX_DOWNLOAD_RESOLUTION = text
+
+    def _on_fps_changed(self, text: str):
+        global MAX_DOWNLOAD_FPS
+        MAX_DOWNLOAD_FPS = int(text)
+
+    def _browse_output(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose download output folder", self.out_input.text() or "."
+        )
+        if folder:
+            self.out_input.setText(folder)
+
+    def _browse_cookies(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose browser profile folder",
+            self.cookie_path_input.text() or os.path.expanduser("~"),
+        )
+        if folder:
+            self.cookie_path_input.setText(folder)
+
+    def _on_cookie_source_changed(self, _=None):
+        global BROWSER
+        path = self.cookie_path_input.text().strip()
+        browser = self.browser_combo.currentText()
+        BROWSER = f"{browser}:{path}" if path else browser
+
+    def _on_user_agent_changed(self, text: str):
+        global USER_AGENT
+        USER_AGENT = text.strip()
 
 
 class StreamDownloaderGUI(QMainWindow):
@@ -859,6 +1031,13 @@ class StreamDownloaderGUI(QMainWindow):
         self._proc_timer.timeout.connect(self._check_processes)
         self._proc_timer.start(5000)
 
+        self._settings_dialog = SettingsDialog(self)
+        # Convenience references so the rest of the class can keep reading
+        # these the same way it always has, without caring that they now
+        # live inside the settings dialog instead of the main toolbar.
+        self._out_input = self._settings_dialog.out_input
+        self._user_agent_input = self._settings_dialog.user_agent_input
+
         self._build_ui()
         self.setStyleSheet(DARK)
         self._load_saved_streams()
@@ -871,12 +1050,31 @@ class StreamDownloaderGUI(QMainWindow):
         saved = load_saved_streams()
         if not saved:
             return
-        if saved:
+        saved_user_agent = saved[0].get("user_agent", "").strip()
+        if saved_user_agent:
+            # Restore the last-used UA across sessions — but only if there
+            # actually was one saved, so an empty entry (e.g. from before
+            # a UA was ever configured) doesn't clobber a real config value.
             global USER_AGENT
-            user_agent = saved[0].get("user_agent", "") if saved else ""
-            USER_AGENT = user_agent
+            USER_AGENT = saved_user_agent
             if self._user_agent_input:
                 self._user_agent_input.setText(USER_AGENT)
+        saved_output = saved[0].get("output_folder", "").strip()
+        if saved_output:
+            global DOWNLOAD_OUTPUT
+            DOWNLOAD_OUTPUT = saved_output
+            if self._out_input:
+                self._out_input.setText(DOWNLOAD_OUTPUT)
+        saved_resolution = str(saved[0].get("max_resolution", "")).strip()
+        if saved_resolution in _RESOLUTION_CHOICES:
+            global MAX_DOWNLOAD_RESOLUTION
+            MAX_DOWNLOAD_RESOLUTION = saved_resolution
+            self._settings_dialog.resolution_combo.setCurrentText(saved_resolution)
+        saved_fps = str(saved[0].get("max_fps", "")).strip()
+        if saved_fps in _FPS_CHOICES:
+            global MAX_DOWNLOAD_FPS
+            MAX_DOWNLOAD_FPS = int(saved_fps)
+            self._settings_dialog.fps_combo.setCurrentText(saved_fps)
         for entry in saved:
             url = entry["url"]
             auto = entry["auto_start"]
@@ -887,9 +1085,10 @@ class StreamDownloaderGUI(QMainWindow):
     def _save(self):
         save_streams(self.stream_items)
 
-    def _on_user_agent_changed(self, text: str):
-        global USER_AGENT
-        USER_AGENT = text.strip()
+    def _open_settings(self):
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
 
     # ── UI construction ─────────────────────────
 
@@ -905,19 +1104,14 @@ class StreamDownloaderGUI(QMainWindow):
         bar.setSpacing(8)
 
         self._url_input = QLineEdit()
-        self._url_input.setPlaceholderText("Stream URL  (e.g. https://chaturbate.com/username/)")
+        self._url_input.setPlaceholderText("https://chaturbate.com/username/")
         self._url_input.returnPressed.connect(self._add_stream)
         bar.addWidget(self._url_input, 4)
 
-        self._out_input = QLineEdit("downloads")
-        self._out_input.setPlaceholderText("Output folder")
-        bar.addWidget(self._out_input, 1)
-
-        self._user_agent_input = QLineEdit()
-        self._user_agent_input.setPlaceholderText("Optional User-Agent")
-        self._user_agent_input.setText(USER_AGENT)
-        self._user_agent_input.textChanged.connect(self._on_user_agent_changed)
-        bar.addWidget(self._user_agent_input, 2)
+        settings_btn = QPushButton("⚙  Settings")
+        settings_btn.setObjectName("settingsBtn")
+        settings_btn.clicked.connect(self._open_settings)
+        bar.addWidget(settings_btn)
 
         add_btn = QPushButton("＋  Add Stream")
         add_btn.setObjectName("addBtn")
@@ -944,7 +1138,7 @@ class StreamDownloaderGUI(QMainWindow):
         ])
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.Fixed)
         hh.setSectionResizeMode(3, QHeaderView.Fixed)
         hh.setSectionResizeMode(4, QHeaderView.Fixed)
@@ -1004,8 +1198,7 @@ class StreamDownloaderGUI(QMainWindow):
 
         # Tooltips
         self._url_input.setToolTip("Enter a Chaturbate stream URL\nExample: https://chaturbate.com/username/")
-        self._out_input.setToolTip("Folder where downloads will be saved")
-        self._user_agent_input.setToolTip("Optional: Override the default user-agent\nUseful for macOS users getting 403 errors")
+        settings_btn.setToolTip("Download output folder, cookies, and User-Agent")
         add_btn.setToolTip("Add the stream to the monitoring list")
         stop_all_btn.setToolTip("Stop ALL active downloads immediately")
 
@@ -1133,7 +1326,7 @@ class StreamDownloaderGUI(QMainWindow):
         if not item:
             return
 
-        worker = DownloadWorker(url, item.username, self._out_input.text().strip() or "downloads")
+        worker = DownloadWorker(url, item.username, self._out_input.text().strip() or "Downloads")
         worker.setParent(self)
         worker.log_signal.connect(self._on_dl_log)
         worker.finished_signal.connect(self._on_dl_finished)
@@ -1451,44 +1644,39 @@ class StreamDownloaderGUI(QMainWindow):
         sb.setValue(sb.maximum())
         self._status_bar.showMessage(message, 3000)
 
-    def _shutdown_workers(self):
-        print("[Debug] _shutdown_workers: shutting down threads")
+    def _wait_for_stop(self, worker: QThread) -> bool:
+        """Waits for a QThread that's already been signaled to stop,
+        escalating to terminate() if it doesn't stop gracefully within
+        5s, then giving it 2s more. Returns False if it's still alive
+        even after that — caller decides what to do (e.g. a DownloadWorker
+        that won't die gets kept around instead of dropped, to avoid a
+        QThread destructor warning on a thread that's still running)."""
+        if not worker.isRunning():
+            return True
+        if not worker.wait(5000):
+            worker.terminate()
+            if not worker.wait(2000):
+                return False
+        return True
 
+    def _shutdown_workers(self):
         for url in list(self.download_workers.keys()):
             worker = self.download_workers.get(url)
             if worker:
-                print(f"[Debug] _shutdown_workers: stopping download worker {worker.objectName()} running={worker.isRunning()}")
                 worker.stop()
+
         still_running = []
         for url in list(self.download_workers.keys()):
             worker = self.download_workers.get(url)
-            if worker and worker.isRunning():
-                print(f"[Debug] _shutdown_workers: waiting for download worker {worker.objectName()}")
-                if not worker.wait(5000):
-                    print(f"[Debug] _shutdown_workers: download worker {worker.objectName()} did not stop in time, terminating")
-                    worker.terminate()
-                    if not worker.wait(2000):
-                        print(f"[Debug] _shutdown_workers: download worker {worker.objectName()} still running after terminate")
-                        still_running.append(url)
-        if still_running:
-            print(f"[Debug] _shutdown_workers: preserving {len(still_running)} running DownloadWorker(s) to avoid QThread destructor warning: {still_running}")
+            if worker and not self._wait_for_stop(worker):
+                still_running.append(url)
         self.download_workers = {url: w for url, w in self.download_workers.items() if url in still_running}
 
-        print(f"[Debug] _shutdown_workers: stopping checker {self.checker.objectName()} running={self.checker.isRunning()}")
         self.checker.stop()
-        if self.checker.isRunning() and not self.checker.wait(5000):
-            print(f"[Debug] _shutdown_workers: StreamChecker did not stop in time, terminating")
-            self.checker.terminate()
-            if not self.checker.wait(2000):
-                print(f"[Debug] _shutdown_workers: StreamChecker still running after terminate")
+        self._wait_for_stop(self.checker)
 
-        print(f"[Debug] _shutdown_workers: stopping preview worker {self.preview_worker.objectName()} running={self.preview_worker.isRunning()}")
         self.preview_worker.stop()
-        if self.preview_worker.isRunning() and not self.preview_worker.wait(5000):
-            print(f"[Debug] _shutdown_workers: SharedPreviewWorker did not stop in time, terminating")
-            self.preview_worker.terminate()
-            if not self.preview_worker.wait(2000):
-                print(f"[Debug] _shutdown_workers: SharedPreviewWorker still running after terminate")
+        self._wait_for_stop(self.preview_worker)
 
     def closeEvent(self, event: QEvent):
         if self.download_workers:
