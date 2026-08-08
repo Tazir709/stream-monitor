@@ -26,8 +26,12 @@ A desktop GUI for monitoring and auto-recording live Chaturbate streams on Windo
 ## 📸 Preview
 
 The application showing multiple stream states:
+<img width="916" height="801" alt="Stream-Monitor" src="https://github.com/user-attachments/assets/dd0c3d51-e145-401c-bd22-31b4ed4784e8" />
 
-![Dashboard Preview](app.png)
+Stream-monitor settings:
+<img width="915" height="803" alt="Stream-Settings" src="https://github.com/user-attachments/assets/e237918c-19c3-48a3-b480-c2570e712416" />
+
+
 ---
 
 ## 📦 Requirements
