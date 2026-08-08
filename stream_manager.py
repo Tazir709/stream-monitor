@@ -30,7 +30,7 @@ from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 # ─────────────────────────────────────────────
 
 USE_COOKIES = True
-BROWSER = "firefox:/home/pie/.floorp/31e5uirm.default-default" # Floorp is Firefox-based; pointing yt-dlp's firefox cookie-reader at its profile dir
+BROWSER = ""
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0" # Optional user-agent string for yt-dlp. Leave empty to use default.
 DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the Settings dialog; persisted across sessions.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
