@@ -551,29 +551,53 @@ class DownloadWorker(QThread):
             self.is_running = False
             self.finished_signal.emit(self.stream_url)
 
+
     def stop(self):
-        """Signal the process tree to stop. Does NOT touch self.process — run() owns it."""
+        """Signal the process tree to stop. Safe to call multiple times."""
+        if not self.is_running:
+            return
+
         proc = self.process
         if not proc:
             return
+
         self.log_signal.emit(self.username, "⏹ Stopping download…")
         self.is_running = False
+
         try:
             parent = psutil.Process(proc.pid)
             children = parent.children(recursive=True)
+
             for p in children:
-                try: p.terminate()
-                except psutil.NoSuchProcess: pass
+                try:
+                    p.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+
             parent.terminate()
-            gone, alive = psutil.wait_procs(children + [parent], timeout=5)
+
+            gone, alive = psutil.wait_procs(
+                children + [parent],
+                timeout=5
+            )
+
             for p in alive:
-                try: p.kill()
-                except psutil.NoSuchProcess: pass
+                try:
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
+
         except (psutil.NoSuchProcess, ProcessLookupError):
             pass
+
         except Exception as e:
-            self.log_signal.emit(self.username, f"❌ Stop error: {str(e)[:80]}")
-            print(f"[Debug] DownloadWorker stop failed for {self.username}: {e!r}")
+            self.log_signal.emit(
+                self.username,
+                f"❌ Stop error: {str(e)[:80]}"
+            )
+            print(
+                f"[Debug] DownloadWorker stop failed for {self.username}: {e!r}"
+            )
             traceback.print_exc()
 
 
@@ -813,40 +837,59 @@ STATUS_STYLE = {
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "streams.json")
 
 
-def load_saved_streams() -> list[dict]:
+def load_saved_streams() -> dict:
     try:
         with open(SAVE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return [
+
+        if isinstance(data, dict):
+            streams = [
                 {
                     "url": e["url"],
                     "auto_start": bool(e.get("auto_start", False)),
-                    "user_agent": e.get("user_agent", ""),
-                    "output_folder": e.get("output_folder", ""),
-                    "max_resolution": e.get("max_resolution", ""),
-                    "max_fps": e.get("max_fps", ""),
+                }
+                for e in data.get("streams", [])
+                if isinstance(e, dict) and e.get("url")
+            ]
+            settings = data.get("settings", {})
+            return {"streams": streams, "settings": settings}
+
+        if isinstance(data, list):
+            streams = [
+                {
+                    "url": e["url"],
+                    "auto_start": bool(e.get("auto_start", False)),
                 }
                 for e in data
                 if isinstance(e, dict) and e.get("url")
             ]
+            settings = {
+                "user_agent": data[0].get("user_agent", "") if data else "",
+                "output_folder": data[0].get("output_folder", "") if data else "",
+                "max_resolution": data[0].get("max_resolution", "") if data else "",
+                "max_fps": data[0].get("max_fps", "") if data else "",
+                "browser": data[0].get("browser", "") if data else "",
+            }
+            return {"streams": streams, "settings": settings}
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         pass
-    return []
+    return {"streams": [], "settings": {}}
 
 
 def save_streams(stream_items: dict) -> None:
-    payload = [
-        {
-            "url": item.url,
-            "auto_start": item.auto_start,
+    payload = {
+        "settings": {
             "user_agent": USER_AGENT,
             "output_folder": DOWNLOAD_OUTPUT,
             "max_resolution": MAX_DOWNLOAD_RESOLUTION,
             "max_fps": MAX_DOWNLOAD_FPS,
-        }
-        for item in stream_items.values()
-    ]
+            "browser": BROWSER,
+        },
+        "streams": [
+            {"url": item.url, "auto_start": item.auto_start}
+            for item in stream_items.values()
+        ],
+    }
     try:
         with open(SAVE_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -867,6 +910,8 @@ class SettingsDialog(QDialog):
     """Setup-once config — output folder, cookies, User-Agent — lives here
     instead of the main toolbar, so day-to-day use (paste a URL, go) stays
     uncluttered."""
+
+    settings_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -962,14 +1007,17 @@ class SettingsDialog(QDialog):
     def _on_output_changed(self, text: str):
         global DOWNLOAD_OUTPUT
         DOWNLOAD_OUTPUT = text.strip() or "Downloads"
+        self.settings_changed.emit()
 
     def _on_resolution_changed(self, text: str):
         global MAX_DOWNLOAD_RESOLUTION
         MAX_DOWNLOAD_RESOLUTION = text
+        self.settings_changed.emit()
 
     def _on_fps_changed(self, text: str):
         global MAX_DOWNLOAD_FPS
         MAX_DOWNLOAD_FPS = int(text)
+        self.settings_changed.emit()
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(
@@ -991,10 +1039,12 @@ class SettingsDialog(QDialog):
         path = self.cookie_path_input.text().strip()
         browser = self.browser_combo.currentText()
         BROWSER = f"{browser}:{path}" if path else browser
+        self.settings_changed.emit()
 
     def _on_user_agent_changed(self, text: str):
         global USER_AGENT
         USER_AGENT = text.strip()
+        self.settings_changed.emit()
 
 
 class StreamDownloaderGUI(QMainWindow):
@@ -1032,6 +1082,8 @@ class StreamDownloaderGUI(QMainWindow):
         self._proc_timer.start(5000)
 
         self._settings_dialog = SettingsDialog(self)
+        self._settings_dialog.settings_changed.connect(self._save)
+
         # Convenience references so the rest of the class can keep reading
         # these the same way it always has, without caring that they now
         # live inside the settings dialog instead of the main toolbar.
@@ -1050,7 +1102,9 @@ class StreamDownloaderGUI(QMainWindow):
         saved = load_saved_streams()
         if not saved:
             return
-        saved_user_agent = saved[0].get("user_agent", "").strip()
+        settings = saved.get("settings", {})
+
+        saved_user_agent = str(settings.get("user_agent", "") or "").strip()
         if saved_user_agent:
             # Restore the last-used UA across sessions — but only if there
             # actually was one saved, so an empty entry (e.g. from before
@@ -1059,23 +1113,37 @@ class StreamDownloaderGUI(QMainWindow):
             USER_AGENT = saved_user_agent
             if self._user_agent_input:
                 self._user_agent_input.setText(USER_AGENT)
-        saved_output = saved[0].get("output_folder", "").strip()
+
+        saved_output = str(settings.get("output_folder", "") or "").strip()
         if saved_output:
             global DOWNLOAD_OUTPUT
             DOWNLOAD_OUTPUT = saved_output
             if self._out_input:
                 self._out_input.setText(DOWNLOAD_OUTPUT)
-        saved_resolution = str(saved[0].get("max_resolution", "")).strip()
+
+        saved_resolution = str(settings.get("max_resolution", "") or "").strip()
         if saved_resolution in _RESOLUTION_CHOICES:
             global MAX_DOWNLOAD_RESOLUTION
             MAX_DOWNLOAD_RESOLUTION = saved_resolution
             self._settings_dialog.resolution_combo.setCurrentText(saved_resolution)
-        saved_fps = str(saved[0].get("max_fps", "")).strip()
+
+        saved_fps = str(settings.get("max_fps", "") or "").strip()
         if saved_fps in _FPS_CHOICES:
             global MAX_DOWNLOAD_FPS
             MAX_DOWNLOAD_FPS = int(saved_fps)
             self._settings_dialog.fps_combo.setCurrentText(saved_fps)
-        for entry in saved:
+
+        saved_browser = str(settings.get("browser", "") or "").strip()
+        if saved_browser:
+            browser, _, path = saved_browser.partition(":")
+            if browser in _BROWSER_CHOICES:
+                if not path or os.path.isdir(path):
+                    global BROWSER
+                    BROWSER = saved_browser
+                    self._settings_dialog.browser_combo.setCurrentText(browser)
+                    self._settings_dialog.cookie_path_input.setText(path)
+
+        for entry in saved.get("streams", []):
             url = entry["url"]
             auto = entry["auto_start"]
             self._add_stream(url=url, auto_start=auto, silent=True)
