@@ -57,19 +57,17 @@ python stream_manager.py
 
 ---
 
-## 🔐 Authentication (optional)
+## 🔐 Authentication
 
-Some streams may require authentication depending on access restrictions (e.g. private or age-restricted content).
+Chaturbate has been tightening access controls over time, so in practice cookies are usually needed for the tool to work at all now — not just for private or age-restricted streams. If a stream appears offline but is known to be live, or checks/downloads fail outright, enable cookies first:
 
-If a stream appears offline but is known to be live, enabling cookies may help:
-
-- Enable cookie support in the configuration:
-  - `USE_COOKIES = True`
-- Select browser source if needed:
-  - `BROWSER = "firefox"`
+- `USE_COOKIES = True`
+- `BROWSER = "firefox"` — set this to whichever browser you're actually logged into Chaturbate with
 
 Supported browsers:
 `firefox`, `chrome`, `chromium`, `edge`, `brave`, `opera`, `safari`
+
+You can also set `USER_AGENT` to a real browser's user-agent string, ideally matching the browser your cookies came from. This has been needed on some platforms (macOS in particular) to avoid being blocked even with valid cookies. Leave it blank to use yt-dlp's default.
 
 ---
 

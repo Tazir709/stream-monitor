@@ -1451,44 +1451,39 @@ class StreamDownloaderGUI(QMainWindow):
         sb.setValue(sb.maximum())
         self._status_bar.showMessage(message, 3000)
 
-    def _shutdown_workers(self):
-        print("[Debug] _shutdown_workers: shutting down threads")
+    def _wait_for_stop(self, worker: QThread) -> bool:
+        """Waits for a QThread that's already been signaled to stop,
+        escalating to terminate() if it doesn't stop gracefully within
+        5s, then giving it 2s more. Returns False if it's still alive
+        even after that — caller decides what to do (e.g. a DownloadWorker
+        that won't die gets kept around instead of dropped, to avoid a
+        QThread destructor warning on a thread that's still running)."""
+        if not worker.isRunning():
+            return True
+        if not worker.wait(5000):
+            worker.terminate()
+            if not worker.wait(2000):
+                return False
+        return True
 
+    def _shutdown_workers(self):
         for url in list(self.download_workers.keys()):
             worker = self.download_workers.get(url)
             if worker:
-                print(f"[Debug] _shutdown_workers: stopping download worker {worker.objectName()} running={worker.isRunning()}")
                 worker.stop()
+
         still_running = []
         for url in list(self.download_workers.keys()):
             worker = self.download_workers.get(url)
-            if worker and worker.isRunning():
-                print(f"[Debug] _shutdown_workers: waiting for download worker {worker.objectName()}")
-                if not worker.wait(5000):
-                    print(f"[Debug] _shutdown_workers: download worker {worker.objectName()} did not stop in time, terminating")
-                    worker.terminate()
-                    if not worker.wait(2000):
-                        print(f"[Debug] _shutdown_workers: download worker {worker.objectName()} still running after terminate")
-                        still_running.append(url)
-        if still_running:
-            print(f"[Debug] _shutdown_workers: preserving {len(still_running)} running DownloadWorker(s) to avoid QThread destructor warning: {still_running}")
+            if worker and not self._wait_for_stop(worker):
+                still_running.append(url)
         self.download_workers = {url: w for url, w in self.download_workers.items() if url in still_running}
 
-        print(f"[Debug] _shutdown_workers: stopping checker {self.checker.objectName()} running={self.checker.isRunning()}")
         self.checker.stop()
-        if self.checker.isRunning() and not self.checker.wait(5000):
-            print(f"[Debug] _shutdown_workers: StreamChecker did not stop in time, terminating")
-            self.checker.terminate()
-            if not self.checker.wait(2000):
-                print(f"[Debug] _shutdown_workers: StreamChecker still running after terminate")
+        self._wait_for_stop(self.checker)
 
-        print(f"[Debug] _shutdown_workers: stopping preview worker {self.preview_worker.objectName()} running={self.preview_worker.isRunning()}")
         self.preview_worker.stop()
-        if self.preview_worker.isRunning() and not self.preview_worker.wait(5000):
-            print(f"[Debug] _shutdown_workers: SharedPreviewWorker did not stop in time, terminating")
-            self.preview_worker.terminate()
-            if not self.preview_worker.wait(2000):
-                print(f"[Debug] _shutdown_workers: SharedPreviewWorker still running after terminate")
+        self._wait_for_stop(self.preview_worker)
 
     def closeEvent(self, event: QEvent):
         if self.download_workers:
