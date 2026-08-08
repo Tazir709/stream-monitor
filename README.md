@@ -33,8 +33,8 @@ The application showing multiple stream states:
 ## 📦 Requirements
 
 - Python 3.10+
-- ffmpeg installed and available in PATH
-- yt-dlp installed and available in PATH
+- ffmpeg installed and available in PATH (can't be installed via pip — needs a real system-level install, see below)
+- yt-dlp — either `pip install`ed into this project's own venv (recommended, see below) or available system-wide on PATH. The app looks for a copy inside its own venv first and falls back to PATH automatically, so either works without any extra setup.
 - Optional but recommended: `curl_cffi`, so yt-dlp can impersonate a real browser's TLS fingerprint instead of Python's default — makes blocking less likely, independent of cookies/User-Agent. yt-dlp runs fine without it (you'll just see a one-line warning that impersonation is unavailable). If you do install it, this yt-dlp release only supports `curl_cffi==0.5.10` or `0.10.x`–`0.15.x` — 0.16+ isn't supported yet, and `pip install curl_cffi` alone will grab the latest (unsupported) version. Check yt-dlp's own `--list-impersonate-targets` output if you're not sure it's working.
 
 ---
@@ -49,7 +49,7 @@ The application showing multiple stream states:
 - **Fedora**: `sudo dnf install python3 python3-pip python3-venv git curl`
 
 ### Step 2 — Install ffmpeg
-`yt-dlp` gets installed via pip in the next step, but `ffmpeg` needs a separate system-level install:
+`yt-dlp` gets installed via pip in the next step, but `ffmpeg` needs a separate system-level install — there's no pip package for the actual binary:
 - **Windows**: Download a build from [ffmpeg.org](https://ffmpeg.org/download.html) and add its `bin` folder to PATH
 - **macOS**: `brew install ffmpeg`
 - **Ubuntu/Debian**: `sudo apt install ffmpeg`
@@ -62,8 +62,8 @@ The application showing multiple stream states:
 ```powershell
 git clone https://github.com/Tazir709/stream-monitor.git
 cd stream-monitor
-python -m venv venv
-venv\Scripts\activate
+python -m venv Stream_Venv
+Stream_Venv\Scripts\activate
 pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
 python stream_manager.py
 ```
@@ -72,19 +72,18 @@ python stream_manager.py
 ```bash
 git clone https://github.com/Tazir709/stream-monitor.git
 cd stream-monitor
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv Stream_Venv
+source Stream_Venv/bin/activate
 pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
 python stream_manager.py
 ```
 
-> **What is a venv?** A virtual environment is an isolated folder that holds Python packages just for this project, so they don't clash with anything else on your system or other Python projects you have installed. Everything `pip install`s above goes into the `venv` folder, not system-wide.
+> **What is a venv?** A virtual environment is an isolated folder that holds Python packages just for this project, so they don't clash with anything else on your system or other Python projects you have installed. Everything `pip install`s above goes into the `Stream_Venv` folder, not system-wide.
 
-**Next time**, you just need to activate the venv again before running the script — you don't need to reinstall anything:
+**Next time**, just run it directly with the venv's own Python — no need to reinstall anything, and you don't even need to reactivate the venv first, since the app finds its own `yt-dlp`/dependencies regardless:
 ```bash
-source venv/bin/activate   # macOS/Linux
-venv\Scripts\activate      # Windows
-python stream_manager.py
+Stream_Venv/bin/python stream_manager.py     # macOS/Linux
+Stream_Venv\Scripts\python.exe stream_manager.py   # Windows
 ```
 
 ---
@@ -160,7 +159,7 @@ Downloads/
 
 ## 🔧 Troubleshooting
 
-**`yt-dlp`/`ffmpeg` errors with "No such file or directory" even though you installed them** — `pip install`ing `yt-dlp` puts it inside your venv, but the app calls it by bare name (`yt-dlp`, `ffmpeg`), which only resolves through your system's PATH. Either activate the venv properly before running (`source venv/bin/activate`, not just invoking the venv's Python binary directly), or install both system-wide instead.
+**`ffmpeg` errors with "No such file or directory" even though `yt-dlp` works fine** — `ffmpeg` can't be `pip install`ed (there's no package for the actual binary), so it always needs a real system-level install and to be on PATH — see Step 2 above. This is different from `yt-dlp`, which the app can find inside its own venv automatically even without activating it.
 
 **A stream shows offline when you know it's live, or downloads fail immediately** — almost always missing cookies. Open Settings and confirm Cookie source is pointed at a browser you're actually logged into Chaturbate with.
 
@@ -180,6 +179,7 @@ Downloads/
 ## 📝 Changelog
 
 ### (August 2026)
+- `yt-dlp`/`ffmpeg` are now found automatically if installed inside this project's own venv, without needing that venv to be activated first — previously the app called them by bare name, which only ever resolved via system PATH regardless of what was actually pip-installed
 - Added a Settings dialog (download output, cookie source with a folder picker, User-Agent, video quality) — moved out of the cramped main toolbar, and every field now persists across restarts
 - Cookies are now always used (no more on/off toggle) — Chaturbate's access controls have tightened enough that this is effectively required anyway; you can still point at a custom Firefox-based browser profile (Floorp, Zen, LibreWolf, etc.) that isn't in the browser list
 - Fixed the stream table not stretching to fill the window width

@@ -6,6 +6,7 @@ import re
 import os
 import sys
 import json
+import shutil
 from enum import Enum
 from typing import Optional, Dict
 from datetime import datetime
@@ -74,6 +75,31 @@ def get_user_agent() -> str:
 
 def should_disable_auto_download(duration_seconds: int) -> bool:
     return duration_seconds < AUTO_DOWNLOAD_DISABLE_SECONDS
+
+
+def _find_tool(name: str) -> str:
+    """Resolve an external tool (yt-dlp, ffmpeg), preferring a copy
+    installed in the venv this app is actually running from — via
+    sys.prefix, so it works whether that venv was "activated" or its
+    Python was invoked directly, without needing to know the venv's
+    folder name in advance. Falls back to PATH if not found there.
+
+    This matters specifically because the app calls these tools by bare
+    name in subprocess calls, which only resolves via PATH — a venv-only
+    pip install of yt-dlp does nothing unless that venv's bin folder is
+    on PATH, which isn't guaranteed for a GUI app people often launch by
+    double-click rather than from an activated terminal.
+    """
+    exe_name = f"{name}.exe" if sys.platform == "win32" else name
+    venv_bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+    venv_path = os.path.join(sys.prefix, venv_bin_dir, exe_name)
+    if os.path.isfile(venv_path):
+        return venv_path
+    return shutil.which(name) or name
+
+
+YTDLP_PATH = _find_tool("yt-dlp")
+FFMPEG_PATH = _find_tool("ffmpeg")
 
 
 # ─────────────────────────────────────────────
@@ -227,7 +253,7 @@ class SharedPreviewWorker(QThread):
             if time.time() < expiry:
                 return stream_url
         try:
-            cmd = ["yt-dlp", "--get-url", "--no-playlist"]
+            cmd = [YTDLP_PATH, "--get-url", "--no-playlist"]
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
@@ -263,7 +289,7 @@ class SharedPreviewWorker(QThread):
         W, H = 320, 180
         user_agent = get_user_agent() or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         cmd = [
-            "ffmpeg",
+            FFMPEG_PATH,
             "-user_agent", user_agent,
             *([ "-headers", f"Referer: {referer}\r\n"] if referer else []),
             "-timeout", "10000000",
@@ -387,7 +413,7 @@ class DownloadWorker(QThread):
         """Ask yt-dlp for the selected format's resolution before starting the download."""
         try:
             cmd = [
-                "yt-dlp",
+                YTDLP_PATH,
                 "--no-playlist",
                 "--format", get_download_format_selector(),
                 "--print", "%(width)sx%(height)s",
@@ -441,7 +467,7 @@ class DownloadWorker(QThread):
             current_time = datetime.now().strftime("%Y-%m-%d %H_%M")
 
             cmd = [
-                "yt-dlp",
+                YTDLP_PATH,
                 "--no-simulate",
                 "--format", get_download_format_selector(),
                 "-o", os.path.join(
@@ -562,7 +588,7 @@ class StreamChecker(QThread):
     BACKOFF_STEP = 30
     MAX_CHECK_INTERVAL = 300
 
-    def __init__(self, ytdlp_path: str = "yt-dlp"):
+    def __init__(self, ytdlp_path: str = YTDLP_PATH):
         super().__init__()
         self.setObjectName("StreamChecker")
         self._ytdlp   = ytdlp_path
@@ -1078,7 +1104,7 @@ class StreamDownloaderGUI(QMainWindow):
         bar.setSpacing(8)
 
         self._url_input = QLineEdit()
-        self._url_input.setPlaceholderText("(https://chaturbate.com/username/)")
+        self._url_input.setPlaceholderText("https://chaturbate.com/username/")
         self._url_input.returnPressed.connect(self._add_stream)
         bar.addWidget(self._url_input, 4)
 
