@@ -1,9 +1,9 @@
-# Chaturbate Stream Monitor & Downloader (GUI Tool)
+# Stream Monitor
 
-A Python + PySide6 application for monitoring live streams, capturing previews, and downloading active streams using `yt-dlp` and `ffmpeg`.
+A desktop GUI for monitoring and auto-recording live Chaturbate streams on Windows, macOS, and Linux — tracks multiple models in parallel, shows live thumbnail previews, and downloads automatically via `yt-dlp` and `ffmpeg` the moment someone goes live.
 
-The tool tracks multiple stream URLs, detects live status, shows real-time previews, and can automatically download active streams.
-
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 [![Latest Release](https://img.shields.io/github/v/release/Tazir709/stream-monitor)](https://github.com/Tazir709/stream-monitor/releases/latest)
 
 ---
@@ -14,15 +14,13 @@ The tool tracks multiple stream URLs, detects live status, shows real-time previ
 
 ## ✨ Features
 
-- Live stream status checker (yt-dlp based)
-- Real-time status updates (online / offline / private / away / error)
-- Automatic preview capture using ffmpeg
-- Stream downloading via yt-dlp
-- Download progress tracking
-- Rate limiting to avoid blocking
-- Multi-threaded workers (GUI stays responsive)
-- Auto-retry on status changes (offline → online)
-- Settings dialog for download output, cookies, User-Agent, and video quality — all persisted across restarts
+- Live stream status checking via `yt-dlp`, with adaptive polling — checks every 90s while a stream is live, backs off up to 300s for streams that stay offline, so idle rooms don't get hammered
+- Real-time thumbnail previews, captured via a single-frame `ffmpeg` grab per stream
+- Automatic recording via `yt-dlp` the moment a tracked stream goes live, with a 5-level format-selector fallback (exact resolution+FPS down to just "best available")
+- Settings dialog for download output, cookies (read live from a real browser's cookie database), User-Agent, and video quality — every field persists across restarts
+- Auto-download protection: streams that repeatedly produce very short recordings get temporarily disabled, instead of thrashing in a start/stop loop
+- Multi-threaded design (Qt worker threads for status-checking, previews, and each active download) so the GUI never blocks
+- Per-stream Auto-start toggle, so already-known streams pick back up automatically next launch
 
 ---
 ## 📸 Preview
@@ -37,14 +35,79 @@ The application showing multiple stream states:
 - Python 3.10+
 - ffmpeg installed and available in PATH
 - yt-dlp installed and available in PATH
-- Optional but recommended: `curl_cffi`, so yt-dlp can impersonate a real browser's TLS fingerprint instead of Python's default — makes blocking less likely, independent of cookies/User-Agent. yt-dlp will run fine without it (you'll just see a one-line warning about impersonation being unavailable). If you install it, this yt-dlp release needs a specific version range: `curl_cffi==0.5.10` or `0.10.x`–`0.15.x` (0.16+ isn't supported yet) — check yt-dlp's own `--list-impersonate-targets` output if you're not sure it's working.
+- Optional but recommended: `curl_cffi`, so yt-dlp can impersonate a real browser's TLS fingerprint instead of Python's default — makes blocking less likely, independent of cookies/User-Agent. yt-dlp runs fine without it (you'll just see a one-line warning that impersonation is unavailable). If you do install it, this yt-dlp release only supports `curl_cffi==0.5.10` or `0.10.x`–`0.15.x` — 0.16+ isn't supported yet, and `pip install curl_cffi` alone will grab the latest (unsupported) version. Check yt-dlp's own `--list-impersonate-targets` output if you're not sure it's working.
 
 ---
 
-## 🐍 Python dependencies
+## 🐍 Installation
 
-```bash
+### Step 1 — Install Python
+- **Windows**: Download from [python.org](https://www.python.org/downloads/) — check **"Add Python to PATH"** during install
+- **macOS**: `brew install python` or download from [python.org](https://www.python.org/downloads/)
+- **Ubuntu/Debian**: `sudo apt install python3 python3-pip python3-venv git curl`
+- **Arch Based**: `sudo pacman -Syu python python-pip python-venv git curl`
+- **Fedora**: `sudo dnf install python3 python3-pip python3-venv git curl`
+
+### Step 2 — Install ffmpeg
+`yt-dlp` gets installed via pip in the next step, but `ffmpeg` needs a separate system-level install:
+- **Windows**: Download a build from [ffmpeg.org](https://ffmpeg.org/download.html) and add its `bin` folder to PATH
+- **macOS**: `brew install ffmpeg`
+- **Ubuntu/Debian**: `sudo apt install ffmpeg`
+- **Arch Based**: `sudo pacman -S ffmpeg`
+- **Fedora**: `sudo dnf install ffmpeg`
+
+### Step 3 — Download and set up
+
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/Tazir709/stream-monitor.git
+cd stream-monitor
+python -m venv venv
+venv\Scripts\activate
 pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
+python stream_manager.py
+```
+
+**macOS / Linux:**
+```bash
+git clone https://github.com/Tazir709/stream-monitor.git
+cd stream-monitor
+python3 -m venv venv
+source venv/bin/activate
+pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
+python stream_manager.py
+```
+
+> **What is a venv?** A virtual environment is an isolated folder that holds Python packages just for this project, so they don't clash with anything else on your system or other Python projects you have installed. Everything `pip install`s above goes into the `venv` folder, not system-wide.
+
+**Next time**, you just need to activate the venv again before running the script — you don't need to reinstall anything:
+```bash
+source venv/bin/activate   # macOS/Linux
+venv\Scripts\activate      # Windows
+python stream_manager.py
+```
+
+---
+
+## ⚙️ Configuration
+
+Most day-to-day settings — download output folder, cookies, User-Agent, and video quality — are configured from inside the app now: click **⚙ Settings** after launching (see [Settings](#️-settings) below). They persist automatically once set; you don't need to edit the script at all for normal use.
+
+A couple of settings are still code-only, at the top of `stream_manager.py`, since they're one-time tuning rather than something you'd change per session:
+
+```python
+# Disable auto-download restarts for a stream if its recordings keep coming
+# out shorter than this many seconds (prevents thrashing on a flaky stream)
+AUTO_DOWNLOAD_DISABLE_SECONDS = 300  # 0 to disable
+
+# Used only to estimate bandwidth usage per resolution — not a hard limit
+DOWNLOAD_BITRATE_KBPS = {
+    "640x360": 896,
+    "960x540": 1696,
+    "1280x720": 3096,
+    "1920x1080": 5128,
+    "3840x2160": 7192,
+}
 ```
 
 ---
@@ -57,7 +120,10 @@ Run the application:
 python stream_manager.py
 ```
 
-Click **⚙ Settings** to configure download output, cookies, User-Agent, and video quality before adding streams — see below.
+1. Click **⚙ Settings** and set your download folder, cookies, and (if needed) User-Agent before adding anything — see below.
+2. Paste a stream URL (e.g. `https://chaturbate.com/username/`) into the top field and click **+ Add Stream**.
+3. Toggle **Auto** on a row to have that stream start recording automatically whenever it goes live, or click **Start**/**Stop** to control it manually.
+4. **Stop All** immediately stops every active download — useful before closing the app if you don't want to wait for the confirmation-per-stream flow.
 
 ---
 
@@ -67,7 +133,7 @@ Everything setup-related lives in one dialog (click **⚙ Settings** in the tool
 
 **Download output** — the folder downloads are saved to. Type a path or use Browse.
 
-**Video quality** — maximum resolution and FPS to download at (yt-dlp falls back gracefully if your exact preference isn't available for a given stream).
+**Video quality** — maximum resolution and FPS to download at (yt-dlp falls back gracefully through lower tiers if your exact preference isn't available for a given stream).
 
 **Cookie source** — cookies are always used now; Chaturbate has been tightening access controls over time, and in practice most streams need them to work at all, not just private/age-restricted ones. Pick which browser you're logged into Chaturbate with from the dropdown:
 
@@ -79,10 +145,37 @@ If you use a Firefox-based browser that isn't in that list (Floorp, Zen, LibreWo
 
 ---
 
+## 📁 Output structure
+
+Recordings are saved flat inside your configured Download output folder, one file per recording session:
+
+```
+Downloads/
+├── some_model 2026-08-09 14_30.mp4
+├── some_model 2026-08-09 18_05.mp4
+└── another_model 2026-08-09 15_12.mp4
+```
+
+---
+
+## 🔧 Troubleshooting
+
+**`yt-dlp`/`ffmpeg` errors with "No such file or directory" even though you installed them** — `pip install`ing `yt-dlp` puts it inside your venv, but the app calls it by bare name (`yt-dlp`, `ffmpeg`), which only resolves through your system's PATH. Either activate the venv properly before running (`source venv/bin/activate`, not just invoking the venv's Python binary directly), or install both system-wide instead.
+
+**A stream shows offline when you know it's live, or downloads fail immediately** — almost always missing cookies. Open Settings and confirm Cookie source is pointed at a browser you're actually logged into Chaturbate with.
+
+**Still blocked even with valid cookies and a matching User-Agent** — two things worth checking: make sure `curl_cffi` is installed in a supported version (`0.5.10` or `0.10.x`–`0.15.x`, see Requirements above) so yt-dlp can impersonate a real browser's TLS fingerprint; and double-check your User-Agent actually matches the browser your cookies came from, not just "some" browser.
+
+**Previews never show up** — preview capture needs `ffmpeg` specifically (separate from `yt-dlp`, which handles the actual downloads). Confirm `ffmpeg -version` works from the same terminal/environment the app is running in.
+
+**App window doesn't seem to open** — a successful launch prints nothing to the terminal at all (this is normal Qt behavior); check for a new window rather than assuming it crashed. If it genuinely didn't start, run it from a terminal to see the actual traceback.
+
+---
+
 ## ⚠️ Known limitations
 
 - Session-based stream URLs may expire during long downloads
-- Some streams may appear “online” but still require authentication for download access
+- Some streams may appear "online" but still require authentication for download access
 
 ## 📝 Changelog
 
