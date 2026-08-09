@@ -150,13 +150,15 @@ If you use a Firefox-based browser that isn't in that list (Floorp, Zen, LibreWo
 
 ## 📁 Output structure
 
-Recordings are saved flat inside your configured Download output folder, one file per recording session:
+Recordings are saved inside your configured Download output folder, one subfolder per model, one file per recording session:
 
 ```
 Downloads/
-├── some_model 2026-08-09 14_30.mp4
-├── some_model 2026-08-09 18_05.mp4
-└── another_model 2026-08-09 15_12.mp4
+├── some_model/
+│   ├── some_model 2026-08-09 14_30.mp4
+│   └── some_model 2026-08-09 18_05.mp4
+└── another_model/
+    └── another_model 2026-08-09 15_12.mp4
 ```
 
 ---

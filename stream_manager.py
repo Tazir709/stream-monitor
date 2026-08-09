@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QSplitter, QFrame, QSizePolicy, QDialog, QFileDialog, QComboBox,
     QFormLayout, QDialogButtonBox
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize, QDir
 from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 
 
@@ -29,9 +29,8 @@ from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 #  Configuration
 # ─────────────────────────────────────────────
 
-USE_COOKIES = True
 BROWSER = ""
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0" # Optional user-agent string for yt-dlp. Leave empty to use default.
+USER_AGENT = ""
 DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the Settings dialog; persisted across sessions.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
@@ -257,8 +256,7 @@ class SharedPreviewWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            if USE_COOKIES:
-                cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(page_url)
             r = subprocess.run(
                 cmd,
@@ -401,13 +399,13 @@ class DownloadWorker(QThread):
         self.setObjectName(f"DownloadWorker-{username}")
         self.stream_url  = stream_url
         self.username    = username
-        self.output_path = output_path
+        self.output_path = os.path.join(output_path, username)
         self.process: Optional[subprocess.Popen] = None
         self.is_running  = False
         self._rate_limiter = RateLimiter(2.0)
         self._line_queue: Queue = Queue()
         self._started_at = 0.0
-        os.makedirs(output_path, exist_ok=True)
+        os.makedirs(self.output_path, exist_ok=True)
 
     def _probe_resolution(self) -> str:
         """Ask yt-dlp for the selected format's resolution before starting the download."""
@@ -421,8 +419,7 @@ class DownloadWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            if USE_COOKIES:
-                cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(self.stream_url)
             r = subprocess.run(
                 cmd,
@@ -482,8 +479,7 @@ class DownloadWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            if USE_COOKIES:
-                cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(self.stream_url)
             self._rate_limiter.wait_if_needed()
 
@@ -680,8 +676,7 @@ class StreamChecker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            if USE_COOKIES:
-                cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(url)
             r = subprocess.run(
                 cmd,
@@ -1020,19 +1015,34 @@ class SettingsDialog(QDialog):
         self.settings_changed.emit()
 
     def _browse_output(self):
+        # No parent, so the dialog doesn't inherit the app's dark
+        # stylesheet — the global QLineEdit padding rule clips text in the
+        # dialog's inline "new folder" rename editor otherwise, since its
+        # row height isn't sized for that extra padding.
         folder = QFileDialog.getExistingDirectory(
-            self, "Choose download output folder", self.out_input.text() or "."
+            None, "Choose download output folder", self.out_input.text() or "."
         )
         if folder:
             self.out_input.setText(folder)
 
     def _browse_cookies(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose browser profile folder",
+        # Browser profile dirs are almost always dotfolders (~/.mozilla,
+        # ~/.floorp, …). The native Linux picker hides those by default and
+        # offers no way to reveal them, so use Qt's own dialog instead,
+        # which we can tell to show hidden entries. No parent, for the same
+        # stylesheet-leak reason as _browse_output above.
+        dialog = QFileDialog(
+            None, "Choose browser profile folder",
             self.cookie_path_input.text() or os.path.expanduser("~"),
         )
-        if folder:
-            self.cookie_path_input.setText(folder)
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setFilter(dialog.filter() | QDir.Filter.Hidden)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected = dialog.selectedFiles()
+            if selected:
+                self.cookie_path_input.setText(selected[0])
 
     def _on_cookie_source_changed(self, _=None):
         global BROWSER
