@@ -29,7 +29,6 @@ from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 #  Configuration
 # ─────────────────────────────────────────────
 
-USE_COOKIES = True
 BROWSER = ""
 USER_AGENT = ""
 DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the Settings dialog; persisted across sessions.
@@ -257,8 +256,7 @@ class SharedPreviewWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            if USE_COOKIES:
-                cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(page_url)
             r = subprocess.run(
                 cmd,
@@ -421,8 +419,7 @@ class DownloadWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            if USE_COOKIES:
-                cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(self.stream_url)
             r = subprocess.run(
                 cmd,
@@ -482,8 +479,7 @@ class DownloadWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            if USE_COOKIES:
-                cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(self.stream_url)
             self._rate_limiter.wait_if_needed()
 
@@ -680,8 +676,7 @@ class StreamChecker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            if USE_COOKIES:
-                cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(["--cookies-from-browser", BROWSER])
             cmd.append(url)
             r = subprocess.run(
                 cmd,
