@@ -52,28 +52,24 @@ DOWNLOAD_BITRATE_KBPS = { # Usage calculation based on 30 fps
 def get_download_format_selector() -> str:
     max_height = int(MAX_DOWNLOAD_RESOLUTION.split("x")[1])
     max_fps = MAX_DOWNLOAD_FPS
-    
-    # Build a format selector with multiple fallback levels
+
+    # Build a format selector with multiple fallback levels.
     return (
-        # Level 1: Exact match (preferred resolution + FPS)
+        # Level 1: Best video up to the preferred resolution and FPS
         f"bestvideo[height<={max_height}][fps<={max_fps}]+bestaudio/"
-        # Level 2: Same resolution, any FPS (if FPS is too high, just take what's available)
+        # Level 2: Best video up to the preferred resolution, regardless of FPS
         f"bestvideo[height<={max_height}]+bestaudio/"
-        # Level 3: Lower resolution, same FPS
+        # Level 3: Best video at or below the preferred FPS, regardless of resolution
         f"bestvideo[fps<={max_fps}]+bestaudio/"
-        # Level 4: Anything goes (best available)
+        # Level 4: Best video and audio available, regardless of resolution or FPS
         f"bestvideo+bestaudio/"
-        # Level 5: Ultimate fallback (if everything else fails)
+        # Level 5: Best combined format available
         f"best"
     )
 
 
 def get_user_agent() -> str:
     return (USER_AGENT or "").strip()
-
-
-def should_disable_auto_download(duration_seconds: int) -> bool:
-    return duration_seconds < AUTO_DOWNLOAD_DISABLE_SECONDS
 
 
 def _find_tool(name: str) -> str:
@@ -124,6 +120,7 @@ class StreamItem:
     last_check_time: float = 0
     download_start_time: float = 0
     resolution: str = ""
+    pending_short_check: bool = False  # last download ended early; awaiting post-download status to decide on auto-disable
 
 
 # ─────────────────────────────────────────────
@@ -382,6 +379,7 @@ class DownloadWorker(QThread):
     progress_signal           = Signal(str, int)   # (username, percent)
     resolution_signal         = Signal(str, str)   # (url, "1920x1080")
     auto_download_disabled_signal = Signal(str)      # url
+    short_download_signal     = Signal(str, int)   # (url, elapsed_seconds) — emitted when a download ends early
 
     _NOISY_PATTERNS = (
         "error reading http response",
@@ -535,8 +533,8 @@ class DownloadWorker(QThread):
 
             if self._started_at:
                 elapsed = int(time.time() - self._started_at)
-                if should_disable_auto_download(elapsed):
-                    self.auto_download_disabled_signal.emit(self.stream_url)
+                if elapsed < AUTO_DOWNLOAD_DISABLE_SECONDS:
+                    self.short_download_signal.emit(self.stream_url, elapsed)
 
         except Exception as e:
             hint = format_error_message(str(e))
@@ -1159,7 +1157,12 @@ class StreamDownloaderGUI(QMainWindow):
             auto = entry["auto_start"]
             self._add_stream(url=url, auto_start=auto, silent=True)
         if saved:
-            self._log_msg(f"📂 Restored {len(saved)} stream(s) from last session", "#888")
+            restored_count = len(saved.get("streams", []))
+            if restored_count:
+                self._log_msg(
+                    f"📂 Restored {restored_count} stream(s) from last session",
+                    "#888"
+                )
 
     def _save(self):
         save_streams(self.stream_items)
@@ -1413,6 +1416,7 @@ class StreamDownloaderGUI(QMainWindow):
         worker.progress_signal.connect(self._on_dl_progress)
         worker.resolution_signal.connect(self._on_resolution)
         worker.auto_download_disabled_signal.connect(self._on_auto_download_disabled)
+        worker.short_download_signal.connect(self._on_short_download)
         self.download_workers[url] = worker
         worker.start()
         item.download_active = True
@@ -1491,6 +1495,13 @@ class StreamDownloaderGUI(QMainWindow):
         item.current_status = status
         item.last_check_time = time.time()
 
+        # If the last download ended early, this fresh check tells us whether
+        # it was a normal end (offline) or a flaky-connection drop (still online).
+        if item.pending_short_check:
+            item.pending_short_check = False
+            if status == StreamStatus.ONLINE:
+                self._on_auto_download_disabled(url)
+
         self.preview_worker.update_status(url, status)
 
         # Clear thumbnail when going offline
@@ -1561,6 +1572,18 @@ class StreamDownloaderGUI(QMainWindow):
     def _on_dl_progress(self, username: str, percent: int):
         self._status_bar.showMessage(f"{username}: {percent}%", 1500)
 
+    def _on_short_download(self, url: str, elapsed: int):
+        """A download ended before AUTO_DOWNLOAD_DISABLE_SECONDS elapsed.
+
+        Don't decide yet — wait for the post-download status check (see
+        _post_download_check / _on_status) to see if the stream is still
+        online. Only a still-online result indicates a flaky connection;
+        an offline result means the stream simply ended normally.
+        """
+        item = self.stream_items.get(url)
+        if item:
+            item.pending_short_check = True
+
     def _on_auto_download_disabled(self, url: str):
         item = self.stream_items.get(url)
         if not item:
@@ -1572,7 +1595,7 @@ class StreamDownloaderGUI(QMainWindow):
             if cb:
                 cb.setChecked(False)
             self._log_msg(
-                f"⚠ Auto-start disabled for {item.username}: download stopped before 10 minutes",
+                f"⚠ Auto-start disabled for {item.username}: download ended unexpectedly while stream was still live",
                 "#FF9800"
             )
 
