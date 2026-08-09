@@ -998,6 +998,7 @@ class SettingsDialog(QDialog):
         if browser in _BROWSER_CHOICES:
             self.browser_combo.setCurrentText(browser)
         self.cookie_path_input.setText(path)
+        self._on_cookie_source_changed()
 
     def _on_output_changed(self, text: str):
         global DOWNLOAD_OUTPUT
