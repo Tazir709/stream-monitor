@@ -29,7 +29,8 @@ The application showing multiple stream states:
 <img width="916" height="801" alt="Stream-Monitor" src="https://github.com/user-attachments/assets/dd0c3d51-e145-401c-bd22-31b4ed4784e8" />
 
 Stream-monitor settings:
-<img width="915" height="803" alt="Stream-Settings" src="https://github.com/user-attachments/assets/e237918c-19c3-48a3-b480-c2570e712416" />
+<img width="915" height="804" alt="Settings_dialog" src="https://github.com/user-attachments/assets/d3c173d4-b724-4919-a229-6ba271b449ce" />
+
 
 
 ---
@@ -54,7 +55,7 @@ Stream-monitor settings:
 
 ### Step 2 — Install ffmpeg
 `yt-dlp` gets installed via pip in the next step, but `ffmpeg` needs a separate system-level install — there's no pip package for the actual binary:
-- **Windows**: Download a build from [ffmpeg.org](https://ffmpeg.org/download.html) and add its `bin` folder to PATH
+- **Windows**: `winget install ffmpeg` (easiest — adds it to PATH automatically), or download a build from [ffmpeg.org](https://ffmpeg.org/download.html) and add its `bin` folder to PATH manually — see [this guide](https://phoenixnap.com/kb/ffmpeg-windows) if you need help with that step
 - **macOS**: `brew install ffmpeg`
 - **Ubuntu/Debian**: `sudo apt install ffmpeg`
 - **Arch Based**: `sudo pacman -S ffmpeg`
@@ -62,29 +63,40 @@ Stream-monitor settings:
 
 ### Step 3 — Download and set up
 
-**Windows (PowerShell):**
-```powershell
-git clone https://github.com/Tazir709/stream-monitor.git
-cd stream-monitor
-python -m venv Stream_Venv
-Stream_Venv\Scripts\activate
-pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
-python stream_manager.py
-```
-
-**macOS / Linux:**
+Clone the repo first:
 ```bash
 git clone https://github.com/Tazir709/stream-monitor.git
 cd stream-monitor
+```
+
+Then either run the setup script for your OS (creates the venv and installs everything in one go), or do it manually — both end up in the same place, the script is just a shortcut:
+
+**Windows — script:**
+```powershell
+setup_windows.bat
+```
+**Windows — manual (PowerShell):**
+```powershell
+python -m venv Stream_Venv
+Stream_Venv\Scripts\activate
+pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
+```
+
+**macOS / Linux — script:**
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+**macOS / Linux — manual:**
+```bash
 python3 -m venv Stream_Venv
 source Stream_Venv/bin/activate
 pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
-python stream_manager.py
 ```
 
 > **What is a venv?** A virtual environment is an isolated folder that holds Python packages just for this project, so they don't clash with anything else on your system or other Python projects you have installed. Everything `pip install`s above goes into the `Stream_Venv` folder, not system-wide.
 
-**Next time**, just double-click `stream_manager.py` (or run `./stream_manager.py` / `python stream_manager.py`) — it automatically relaunches itself under `Stream_Venv`'s own Python no matter how it's started, so the venv never needs activating or targeting manually. On Windows this launches without a console window popping up behind the GUI.
+Once that's done (whichever way you set it up), just double-click `stream_manager.py` (or run `./stream_manager.py` / `python stream_manager.py`) to launch it — every time, not just the first — it automatically relaunches itself under `Stream_Venv`'s own Python no matter how it's started, so the venv never needs activating or targeting manually. On Windows this launches without a console window popping up behind the GUI.
 
 ---
 
@@ -92,10 +104,9 @@ python stream_manager.py
 
 Most day-to-day settings — download output folder, cookies, User-Agent, video quality, and the auto-restart short-download protection — are configured from inside the app now: click **⚙ Settings** after launching (see [Settings](#️-settings) below). They persist automatically once set; you don't need to edit the script at all for normal use.
 
-One setting is still code-only, at the top of `stream_manager.py`, since it's one-time tuning rather than something you'd change per session:
+One setting is still code-only, at the top of `stream_manager.py`, since it's one-time tuning rather than something you'd change per session. `DOWNLOAD_BITRATE_KBPS` maps each resolution to an expected bitrate in kbps, used to power the **"Download info"** estimate at the bottom of the main window — it shows roughly how much data each active recording is using per hour, and a combined total across everything currently downloading. It's just an estimate, not a real measurement or a limit of any kind, so most people never need to touch it — the only reason to edit it is if you want more accurate MB/h-per-resolution numbers for your own typical streams than the defaults below give you:
 
 ```python
-# Used only to estimate bandwidth usage per resolution — not a hard limit
 DOWNLOAD_BITRATE_KBPS = {
     "640x360": 896,
     "960x540": 1696,
@@ -111,9 +122,12 @@ DOWNLOAD_BITRATE_KBPS = {
 
 Run the application:
 
-```bash
-python stream_manager.py
-```
+### Run the application
+
+- **Windows:** double-click `stream_manager.py`
+- **macOS/Linux:** `./stream_manager.py`
+
+No venv activation or interpreter path needed either way — it relaunches itself automatically.
 
 1. Click **⚙ Settings** and set your download folder, cookies, and (if needed) User-Agent before adding anything — see below.
 2. Paste a stream URL (e.g. `https://chaturbate.com/username/`) into the top field and click **+ Add Stream**.
@@ -182,7 +196,7 @@ Downloads/
 
 **Previews never show up** — preview capture needs `ffmpeg` specifically (separate from `yt-dlp`, which handles the actual downloads). Confirm `ffmpeg -version` works from the same terminal/environment the app is running in.
 
-**Chrome/Chromium cookie access fails on Windows** (`"could not copy chrome cookie database"` or `"failed to decrypt with DPAPI"` in the log) — a known Chrome-on-Windows limitation, not a bug in this app; closing the browser doesn't reliably fix it. Either export your cookies (see [Exporting cookies](#-exporting-cookies) above) and select the file in Settings' **Cookies file** row, or switch to a Firefox-based browser instead, which isn't affected.
+**A popup says Chrome/Chromium cookie access failed** — the app checks this automatically for Chrome/Edge/Brave/Opera on Windows and warns you if it fails; it's a known Chrome-on-Windows limitation, not a bug in this app, and closing the browser doesn't reliably fix it. Either export your cookies (see [Exporting cookies](#-exporting-cookies) above) and select the file in Settings' **Cookies file** row, or switch to a Firefox-based browser instead, which isn't affected.
 
 **App window doesn't seem to open** — a successful launch prints nothing to the terminal at all (this is normal Qt behavior); check for a new window rather than assuming it crashed. If it genuinely didn't start, run it from a terminal to see the actual traceback.
 
@@ -190,7 +204,7 @@ Downloads/
 
 ## ⚠️ Known limitations
 
-* Some streams may appear "online" but still require authentication for download access
+* Some streams may appear "online" but still require authentication for download access — cookies fix this, see [Troubleshooting](#-troubleshooting) above
 * **Chromium-based browsers on Windows:** cookie access can be unreliable — see [Troubleshooting](#-troubleshooting) above for how to fix it.
 
 
