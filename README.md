@@ -179,8 +179,9 @@ Downloads/
 
 ## ⚠️ Known limitations
 
-- Session-based stream URLs may expire during long downloads
-- Some streams may appear "online" but still require authentication for download access
+* Some streams may appear "online" but still require authentication for download access
+* **Chromium-based browsers on Windows:** yt-dlp may be unable to access the browser's cookie database while using Chrome, Edge, or other Chromium-based browsers. If this occurs, try using Firefox or another supported non-Chromium browser, or see [yt-dlp issue #7271](https://github.com/yt-dlp/yt-dlp/issues/7271) for available workarounds.
+
 
 ## 📝 Changelog
 
