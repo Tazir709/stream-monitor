@@ -29,7 +29,8 @@ The application showing multiple stream states:
 <img width="916" height="801" alt="Stream-Monitor" src="https://github.com/user-attachments/assets/dd0c3d51-e145-401c-bd22-31b4ed4784e8" />
 
 Stream-monitor settings:
-<img width="915" height="803" alt="Stream-Settings" src="https://github.com/user-attachments/assets/e237918c-19c3-48a3-b480-c2570e712416" />
+<img width="915" height="804" alt="Settings_dialog" src="https://github.com/user-attachments/assets/d3c173d4-b724-4919-a229-6ba271b449ce" />
+
 
 
 ---
@@ -54,7 +55,7 @@ Stream-monitor settings:
 
 ### Step 2 — Install ffmpeg
 `yt-dlp` gets installed via pip in the next step, but `ffmpeg` needs a separate system-level install — there's no pip package for the actual binary:
-- **Windows**: Download a build from [ffmpeg.org](https://ffmpeg.org/download.html) and add its `bin` folder to PATH
+- **Windows**: `winget install ffmpeg` (easiest — adds it to PATH automatically), or download a build from [ffmpeg.org](https://ffmpeg.org/download.html) and add its `bin` folder to PATH manually — see [this guide](https://phoenixnap.com/kb/ffmpeg-windows) if you need help with that step
 - **macOS**: `brew install ffmpeg`
 - **Ubuntu/Debian**: `sudo apt install ffmpeg`
 - **Arch Based**: `sudo pacman -S ffmpeg`
@@ -62,48 +63,50 @@ Stream-monitor settings:
 
 ### Step 3 — Download and set up
 
-**Windows (PowerShell):**
-```powershell
-git clone https://github.com/Tazir709/stream-monitor.git
-cd stream-monitor
-python -m venv Stream_Venv
-Stream_Venv\Scripts\activate
-pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
-python stream_manager.py
-```
-
-**macOS / Linux:**
+Clone the repo first:
 ```bash
 git clone https://github.com/Tazir709/stream-monitor.git
 cd stream-monitor
+```
+
+Then either run the setup script for your OS (creates the venv and installs everything in one go), or do it manually — both end up in the same place, the script is just a shortcut:
+
+**Windows — script:**
+```powershell
+setup_windows.bat
+```
+**Windows — manual (PowerShell):**
+```powershell
+python -m venv Stream_Venv
+Stream_Venv\Scripts\activate
+pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
+```
+
+**macOS / Linux — script:**
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+**macOS / Linux — manual:**
+```bash
 python3 -m venv Stream_Venv
 source Stream_Venv/bin/activate
 pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
-python stream_manager.py
 ```
 
 > **What is a venv?** A virtual environment is an isolated folder that holds Python packages just for this project, so they don't clash with anything else on your system or other Python projects you have installed. Everything `pip install`s above goes into the `Stream_Venv` folder, not system-wide.
 
-**Next time**, just run it directly with the venv's own Python — no need to reinstall anything, and you don't even need to reactivate the venv first, since the app finds its own `yt-dlp`/dependencies regardless:
-```bash
-Stream_Venv/bin/python stream_manager.py     # macOS/Linux
-Stream_Venv\Scripts\python.exe stream_manager.py   # Windows
-```
+Once that's done (whichever way you set it up), just double-click `stream_manager.py` (or run `./stream_manager.py` / `python stream_manager.py`) to launch it — every time, not just the first — it automatically relaunches itself under `Stream_Venv`'s own Python no matter how it's started, so the venv never needs activating or targeting manually. On Windows this launches without a console window popping up behind the GUI.
 
 ---
 
 ## ⚙️ Configuration
 
-Most day-to-day settings — download output folder, cookies, User-Agent, and video quality — are configured from inside the app now: click **⚙ Settings** after launching (see [Settings](#️-settings) below). They persist automatically once set; you don't need to edit the script at all for normal use.
+Most day-to-day settings — download output folder, cookies, User-Agent, video quality, and the auto-restart short-download protection — are configured from inside the app now: click **⚙ Settings** after launching (see [Settings](#️-settings) below). They persist automatically once set; you don't need to edit the script at all for normal use.
 
-A couple of settings are still code-only, at the top of `stream_manager.py`, since they're one-time tuning rather than something you'd change per session:
+One setting is still code-only, at the top of `stream_manager.py`, since it's one-time tuning rather than something you'd change per session. `DOWNLOAD_BITRATE_KBPS` maps each resolution to an expected bitrate in kbps, used to power the **"Download info"** estimate at the bottom of the main window — it shows roughly how much data each active recording is using per hour, and a combined total across everything currently downloading. It's just an estimate, not a real measurement or a limit of any kind, so most people never need to touch it — the only reason to edit it is if you want more accurate MB/h-per-resolution numbers for your own typical streams than the defaults below give you:
 
 ```python
-# Disable auto-download restarts for a stream if its recordings keep coming
-# out shorter than this many seconds (prevents thrashing on a flaky stream)
-AUTO_DOWNLOAD_DISABLE_SECONDS = 300  # 0 to disable
-
-# Used only to estimate bandwidth usage per resolution — not a hard limit
 DOWNLOAD_BITRATE_KBPS = {
     "640x360": 896,
     "960x540": 1696,
@@ -119,9 +122,12 @@ DOWNLOAD_BITRATE_KBPS = {
 
 Run the application:
 
-```bash
-python stream_manager.py
-```
+### Run the application
+
+- **Windows:** double-click `stream_manager.py`
+- **macOS/Linux:** `./stream_manager.py`
+
+No venv activation or interpreter path needed either way — it relaunches itself automatically.
 
 1. Click **⚙ Settings** and set your download folder, cookies, and (if needed) User-Agent before adding anything — see below.
 2. Paste a stream URL (e.g. `https://chaturbate.com/username/`) into the top field and click **+ Add Stream**.
@@ -138,13 +144,30 @@ Everything setup-related lives in one dialog (click **⚙ Settings** in the tool
 
 **Video quality** — maximum resolution and FPS to download at (yt-dlp falls back gracefully through lower tiers if your exact preference isn't available for a given stream).
 
+**Disable auto-restart if shorter than** — if a stream's auto-restarted recording ends before this much time has passed, auto-restart is temporarily disabled for that stream, to protect against a restart-loop on flaky streams. Pick a value (2/5/10/15/20/30, or `Custom` for an exact number) and a unit (seconds/minutes), or check **Off** to disable this protection entirely.
+
+**Auto re-enable after** — once auto-restart gets disabled for a flaky stream (above), automatically re-check Auto for it after this much time, giving the stream a chance to settle before retrying. Pick a value (5/10/15/30/60, or `Custom`) and a unit (minutes/hours), or check **Off** (the default) to require re-checking Auto yourself instead — no set-and-forget retry.
+
 **Cookie source** — cookies are always used now; Chaturbate has been tightening access controls over time, and in practice most streams need them to work at all, not just private/age-restricted ones. Pick which browser you're logged into Chaturbate with from the dropdown:
 
-`firefox`, `chrome`, `chromium`, `edge`, `brave`, `opera`, `safari`
+`chrome`, `chromium`, `edge`, `brave`, `opera`, `safari`, `Firefox-based`
 
-If you use a Firefox-based browser that isn't in that list (Floorp, Zen, LibreWolf, etc.), leave the browser dropdown on `firefox` and browse directly to that browser's profile folder instead — it uses the same cookie storage format under the hood, so this works even though the browser itself isn't one yt-dlp recognizes by name.
+Picking `Firefox-based` reveals a second dropdown: `Firefox`, `Floorp`, `Zen`, `LibreWolf`, or `Other (browse manually)`. Firefox, Floorp, Zen, and LibreWolf all auto-detect their default profile automatically — the button next to the dropdowns just reads **Browse…** in that case, since nothing needs picking. If detection fails, or you pick `Other` (for any other Firefox-based browser not listed, or a non-default profile), click that button to point at the profile folder directly — once set, it shows the chosen path instead of "Browse…".
+
+**Cookies file** (Windows only, Chrome/Chromium/Edge/Brave/Opera) — this row only appears on Windows when one of those browsers is selected, since Chromium-based browsers can fail to expose cookies to yt-dlp there (a known Windows-only limitation, not a bug in this app — closing the browser doesn't reliably fix it). If that happens, export your cookies (see [Exporting cookies](#-exporting-cookies) below) and select the file here — it's used instead of live browser extraction. Click **✕** to clear it and go back to normal extraction. Not needed at all on Linux/macOS, or for Firefox-based browsers.
 
 **User-Agent** — a real browser's user-agent string, ideally matching the browser your cookies came from. Often needed to get past Cloudflare's Turnstile check, even with valid cookies — this has come up on macOS in particular. Find yours by searching "what is my user agent", or visit whatsmyua.info. Leave it blank to use yt-dlp's default.
+
+---
+
+## 🍪 Exporting cookies
+
+Only relevant if the **Cookies file** fallback above ever comes up (Chromium browsers on Windows) — most users never need this.
+
+1. Install [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) in the browser you're logged into Chaturbate with.
+2. Log into chaturbate.com normally in that browser.
+3. Click the extension's icon, export cookies (either just for chaturbate.com or all sites both work), and save the resulting `.txt` file somewhere you'll remember.
+4. In Stream Monitor's Settings, with that Chromium browser selected, click the **Cookies file** row's button and pick the file you just saved.
 
 ---
 
@@ -155,10 +178,10 @@ Recordings are saved inside your configured Download output folder, one subfolde
 ```
 Downloads/
 ├── some_model/
-│   ├── some_model 2026-08-09 14_30.mp4
-│   └── some_model 2026-08-09 18_05.mp4
+│   ├── some_model 2026-08-09 14_30_05.mp4
+│   └── some_model 2026-08-09 18_05_41.mp4
 └── another_model/
-    └── another_model 2026-08-09 15_12.mp4
+    └── another_model 2026-08-09 15_12_18.mp4
 ```
 
 ---
@@ -173,14 +196,16 @@ Downloads/
 
 **Previews never show up** — preview capture needs `ffmpeg` specifically (separate from `yt-dlp`, which handles the actual downloads). Confirm `ffmpeg -version` works from the same terminal/environment the app is running in.
 
+**A popup says Chrome/Chromium cookie access failed** — the app checks this automatically for Chrome/Edge/Brave/Opera on Windows and warns you if it fails; it's a known Chrome-on-Windows limitation, not a bug in this app, and closing the browser doesn't reliably fix it. Either export your cookies (see [Exporting cookies](#-exporting-cookies) above) and select the file in Settings' **Cookies file** row, or switch to a Firefox-based browser instead, which isn't affected.
+
 **App window doesn't seem to open** — a successful launch prints nothing to the terminal at all (this is normal Qt behavior); check for a new window rather than assuming it crashed. If it genuinely didn't start, run it from a terminal to see the actual traceback.
 
 ---
 
 ## ⚠️ Known limitations
 
-* Some streams may appear "online" but still require authentication for download access
-* **Chromium-based browsers on Windows:** yt-dlp may be unable to access the browser's cookie database while using Chrome, Edge, or other Chromium-based browsers. If this occurs, try using Firefox or another supported non-Chromium browser, or see [yt-dlp issue #7271](https://github.com/yt-dlp/yt-dlp/issues/7271) for available workarounds.
+* Some streams may appear "online" but still require authentication for download access — cookies fix this, see [Troubleshooting](#-troubleshooting) above
+* **Chromium-based browsers on Windows:** cookie access can be unreliable — see [Troubleshooting](#-troubleshooting) above for how to fix it.
 
 
 ## 📝 Changelog
@@ -192,7 +217,7 @@ Downloads/
 - Fixed the stream table not stretching to fill the window width
 - Removed duplicated shutdown logic and debug logging left over from development, including a `libshiboken`/"already deleted" error that could print on close
 - Added user-agent support for macOS compatibility (improves compatibility with some platforms)
-- Improved filename format: `username YYYY-MM-DD HH_MM.mp4`
+- Improved filename format: `username YYYY-MM-DD HH_MM_SS.mp4` (includes seconds, so an auto-restart within the same minute as a previous recording ended doesn't collide with it and silently get skipped)
 - Added smart fallback for resolution selection when preferred formats are unavailable
 - Added adaptive stream checking: offline streams now use gradually longer check intervals to reduce unnecessary requests while still detecting new streams quickly
 - Added auto-download protection: streams that repeatedly produce very short downloads are temporarily disabled to prevent restart loops
