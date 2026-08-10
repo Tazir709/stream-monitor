@@ -1,10 +1,48 @@
+#!/usr/bin/env bash
+""":"
+exec "$(dirname "$0")/Stream_Venv/bin/python3" "$0" "$@"
+":"""
+
+import os
+import sys
+from pathlib import Path
+
+IS_WINDOWS = sys.platform.startswith("win")
+
+# ============================================================
+# SELF-RELAUNCH — always run under this project's own venv Python, no
+# matter how the script was started (double-click, system Python, a bare
+# `python stream_manager.py`, etc). Must happen before any non-stdlib
+# import (PySide6) -- that only exists inside the venv. On Windows this
+# targets pythonw.exe specifically, so double-clicking never pops up a
+# console window behind the GUI.
+# ============================================================
+_script_dir = Path(__file__).resolve().parent
+_venv_dir = _script_dir / "Stream_Venv"
+if IS_WINDOWS:
+    _target_python = _venv_dir / "Scripts" / "pythonw.exe"
+    if not _target_python.exists():
+        _target_python = _venv_dir / "Scripts" / "python.exe"
+    _already_there = Path(sys.executable).resolve() == _target_python.resolve()
+else:
+    _target_python = _venv_dir / "bin" / "python3"
+    _already_there = Path(sys.prefix).resolve() == _venv_dir.resolve()
+
+if not _already_there:
+    if not _target_python.exists():
+        print(f"Stream_Venv not found at {_target_python}")
+        print("Run setup.sh (Unix) or setup_windows.bat (Windows) first.")
+        if IS_WINDOWS:
+            input("\nPress Enter to close this window...")
+        sys.exit(1)
+    os.execv(str(_target_python), [str(_target_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
 import subprocess
+import tempfile
 import time
 import threading
 import psutil
 import re
-import os
-import sys
 import json
 import shutil
 from enum import Enum
@@ -19,10 +57,10 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QLabel, QPushButton, QLineEdit,
     QTextEdit, QCheckBox, QStatusBar, QMessageBox, QHeaderView,
     QSplitter, QFrame, QSizePolicy, QDialog, QFileDialog, QComboBox,
-    QFormLayout, QDialogButtonBox
+    QFormLayout, QDialogButtonBox, QSpinBox
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize, QDir
-from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize, QDir, QUrl
+from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QDesktopServices
 
 
 # ─────────────────────────────────────────────
@@ -30,6 +68,8 @@ from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 # ─────────────────────────────────────────────
 
 BROWSER = ""
+BROWSER_DISPLAY = ""  # "Floorp"/"Zen"/"LibreWolf" when a fork preset is active, else derived from BROWSER directly
+COOKIES_FILE = ""  # optional exported-cookies.txt fallback for Chromium browsers on Windows
 USER_AGENT = ""
 DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the Settings dialog; persisted across sessions.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
@@ -38,7 +78,13 @@ MAX_DOWNLOAD_FPS = 30 # 60 or 30
 # Prevents unstable streams from continuously rejoining the download queue
 # when the system is under heavy load. Prioritizing fewer stable downloads
 # is preferable to having many unstable downloads repeatedly stopping and restarting.
-AUTO_DOWNLOAD_DISABLE_SECONDS = 300 # Disable auto-download if the stream is shorter than this many seconds. 0 to disable
+# Settable from the Settings dialog; persisted across sessions. 0 to disable.
+AUTO_DOWNLOAD_DISABLE_SECONDS = 300
+
+# 0 = off (today's manual-only behavior), the safe default for a new opt-in
+# feature. Otherwise, a stream disabled by the protection above gets its
+# Auto-restart automatically re-checked after this many seconds.
+AUTO_REENABLE_COOLDOWN_SECONDS = 0
 
 DOWNLOAD_BITRATE_KBPS = { # Usage calculation based on 30 fps
     "640x360": 896,
@@ -70,6 +116,15 @@ def get_download_format_selector() -> str:
 
 def get_user_agent() -> str:
     return (USER_AGENT or "").strip()
+
+
+def get_cookie_args() -> list[str]:
+    """--cookies <file> if a Chromium-browser cookies.txt fallback is
+    configured and still exists, else the normal --cookies-from-browser."""
+    real_browser = BROWSER.split(":", 1)[0]
+    if COOKIES_FILE and real_browser in _CHROMIUM_BROWSERS and os.path.isfile(COOKIES_FILE):
+        return ["--cookies", COOKIES_FILE]
+    return ["--cookies-from-browser", BROWSER]
 
 
 def _find_tool(name: str) -> str:
@@ -153,16 +208,14 @@ def log_exception(prefix: str) -> None:
     traceback.print_exc()
 
 
+CHROMIUM_COOKIE_ERROR_MSG = "🔒 Chrome cookie access failed — see Troubleshooting in the README"
+
+
 def format_error_message(stderr: str, stdout: str = "") -> str:
     text = f"{stderr}\n{stdout}".lower()
 
-    if "could not copy chrome cookie database" in text:
-        return (
-            "Could not access Chromium cookies. "
-            "See https://github.com/yt-dlp/yt-dlp/issues/7271 "
-            "for ways to fix Chromium cookie access, or try a different browser. "
-            "(yt-dlp/Chromium cookie access issue on Windows)"
-        )
+    if "could not copy chrome cookie database" in text or "failed to decrypt with dpapi" in text:
+        return CHROMIUM_COOKIE_ERROR_MSG
     if "403" in text or "forbidden" in text or "access denied" in text:
         return "🚫 Access blocked (403). Try setting a User-Agent or enabling cookies."
     if "age restricted" in text or "age-restricted" in text:
@@ -181,6 +234,40 @@ def format_error_message(stderr: str, stdout: str = "") -> str:
     # Catch-all with a hint to check logs
     clean_error = stderr.replace("\n", " ").strip()[:100]
     return f"❌ Operation failed: {clean_error}... (Check the log for details)"
+
+
+# ─────────────────────────────────────────────
+#  Cookie access probe
+# ─────────────────────────────────────────────
+
+class CookieProbeWorker(QThread):
+    """One-shot check of whether yt-dlp can actually read a given
+    Chromium browser's cookies on this machine -- needs no URL, since
+    cookie loading happens during yt-dlp's own init, before it ever
+    checks for one."""
+    result_signal = Signal(str, bool)  # (real_browser, accessible)
+
+    def __init__(self, real_browser: str):
+        super().__init__()
+        self.real_browser = real_browser
+
+    def run(self):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
+            tmp_path = tmp.name
+        os.unlink(tmp_path)  # want a unique path, not an existing file
+        accessible = True
+        try:
+            cmd = [YTDLP_PATH, "--cookies-from-browser", self.real_browser, "--cookies", tmp_path]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            text = f"{r.stderr}\n{r.stdout}".lower()
+            if "could not copy chrome cookie database" in text or "failed to decrypt with dpapi" in text:
+                accessible = False
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        self.result_signal.emit(self.real_browser, accessible)
 
 
 # ─────────────────────────────────────────────
@@ -260,7 +347,7 @@ class SharedPreviewWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(get_cookie_args())
             cmd.append(page_url)
             r = subprocess.run(
                 cmd,
@@ -424,7 +511,7 @@ class DownloadWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(get_cookie_args())
             cmd.append(self.stream_url)
             r = subprocess.run(
                 cmd,
@@ -466,7 +553,7 @@ class DownloadWorker(QThread):
 
             self._started_at = time.time()
 
-            current_time = datetime.now().strftime("%Y-%m-%d %H_%M")
+            current_time = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
 
             cmd = [
                 YTDLP_PATH,
@@ -484,7 +571,7 @@ class DownloadWorker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(get_cookie_args())
             cmd.append(self.stream_url)
             self._rate_limiter.wait_if_needed()
 
@@ -681,7 +768,7 @@ class StreamChecker(QThread):
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
-            cmd.extend(["--cookies-from-browser", BROWSER])
+            cmd.extend(get_cookie_args())
             cmd.append(url)
             r = subprocess.run(
                 cmd,
@@ -883,7 +970,11 @@ def save_streams(stream_items: dict) -> None:
             "output_folder": DOWNLOAD_OUTPUT,
             "max_resolution": MAX_DOWNLOAD_RESOLUTION,
             "max_fps": MAX_DOWNLOAD_FPS,
+            "auto_timeout_seconds": AUTO_DOWNLOAD_DISABLE_SECONDS,
+            "auto_reenable_cooldown_seconds": AUTO_REENABLE_COOLDOWN_SECONDS,
             "browser": BROWSER,
+            "browser_display": BROWSER_DISPLAY,
+            "cookies_file": COOKIES_FILE,
         },
         "streams": [
             {"url": item.url, "auto_start": item.auto_start}
@@ -902,8 +993,143 @@ def save_streams(stream_items: dict) -> None:
 # ─────────────────────────────────────────────
 
 _BROWSER_CHOICES = ["firefox", "chrome", "chromium", "edge", "brave", "opera", "safari"]
+_CHROMIUM_BROWSERS = {"chrome", "chromium", "edge", "brave", "opera"}
+# Polished display names for the dropdown -- yt-dlp itself only accepts the
+# lowercase values in _BROWSER_CHOICES above, so these are translated back
+# and forth rather than used as the actual --cookies-from-browser value.
+_BROWSER_DISPLAY_NAMES = {
+    "chrome": "Chrome", "chromium": "Chromium", "edge": "Edge",
+    "brave": "Brave", "opera": "Opera", "safari": "Safari",
+}
+_BROWSER_DISPLAY_TO_REAL = {v: k for k, v in _BROWSER_DISPLAY_NAMES.items()}
+
+# Firefox-based forks yt-dlp doesn't recognize by name. Base folders below
+# are confirmed against real installs on Linux + Windows; Mac entries are
+# inferred from the same per-browser naming convention (unverified on real
+# hardware -- detection just fails gracefully to manual Browse if wrong).
+_FIREFOX_FORK_BASE_DIRS = {
+    "Floorp": {
+        "linux": lambda: [os.path.expanduser("~/.floorp")],
+        "win32": lambda: [os.path.join(os.environ.get("APPDATA", ""), "Floorp")],
+        "darwin": lambda: [os.path.expanduser("~/Library/Application Support/Floorp")],
+    },
+    "Zen": {
+        "linux": lambda: [os.path.expanduser("~/.config/zen")],
+        "win32": lambda: [os.path.join(os.environ.get("APPDATA", ""), "zen")],
+        "darwin": lambda: [os.path.expanduser("~/Library/Application Support/zen")],
+    },
+    "LibreWolf": {
+        # Confirmed on Arch's official pacman package: nested one level
+        # deeper (~/.config/librewolf/librewolf) than Zen's flat layout --
+        # try that first, then fall back to the flat layout other install
+        # methods (official tarball, other distros) may use instead.
+        "linux": lambda: [
+            os.path.expanduser("~/.config/librewolf/librewolf"),
+            os.path.expanduser("~/.config/librewolf"),
+        ],
+        "win32": lambda: [os.path.join(os.environ.get("APPDATA", ""), "librewolf")],
+        "darwin": lambda: [os.path.expanduser("~/Library/Application Support/librewolf")],
+    },
+}
+_BROWSER_TOP_CHOICES = ["Firefox-based"] + [_BROWSER_DISPLAY_NAMES[c] for c in _BROWSER_CHOICES if c != "firefox"]
+_FIREFOX_VARIANT_CHOICES = ["Firefox"] + list(_FIREFOX_FORK_BASE_DIRS) + ["Other (browse manually)"]
+
+
+def _read_ini_sections(path: str) -> dict:
+    sections, current = {}, None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            m = re.match(r"^\[(.+)\]$", line)
+            if m:
+                current = m.group(1)
+                sections[current] = {}
+            elif current and "=" in line:
+                k, _, v = line.partition("=")
+                sections[current][k.strip()] = v.strip()
+    return sections
+
+
+def _resolve_default_profile(base_dir: str) -> str:
+    """Parse profiles.ini (+ installs.ini) the way Firefox-based browsers
+    do, preferring an install-specific default over the plain Default=1
+    flag -- confirmed necessary against real Zen/LibreWolf installs, where
+    they disagree."""
+    ini_path = os.path.join(base_dir, "profiles.ini")
+    if not os.path.isfile(ini_path):
+        return ""
+    sections = _read_ini_sections(ini_path)
+    installs_path = os.path.join(base_dir, "installs.ini")
+    if os.path.isfile(installs_path):
+        for key, values in _read_ini_sections(installs_path).items():
+            sections[f"Install_{key}"] = values
+
+    target = None
+    for key, values in sections.items():
+        if key.startswith("Install"):
+            target = values.get("Default") or target
+    if not target:
+        for key, values in sections.items():
+            if key.startswith("Profile") and values.get("Default") == "1":
+                target = values.get("Path")
+    if not target:
+        return ""
+    full = os.path.join(base_dir, target)
+    return full if os.path.isdir(full) else ""
+
+
+def _detect_fork_default_profile(fork_name: str) -> str:
+    platform_key = "win32" if sys.platform == "win32" else "darwin" if sys.platform == "darwin" else "linux"
+    getter = _FIREFOX_FORK_BASE_DIRS.get(fork_name, {}).get(platform_key)
+    if not getter:
+        return ""
+    for base_dir in getter():
+        if base_dir and os.path.isdir(base_dir):
+            resolved = _resolve_default_profile(base_dir)
+            if resolved:
+                return resolved
+    return ""
+
+
 _RESOLUTION_CHOICES = ["640x360", "960x540", "1280x720", "1920x1080", "3840x2160"]
 _FPS_CHOICES = ["30", "60"]
+_AUTO_TIMEOUT_VALUE_CHOICES = ["2", "5", "10", "15", "20", "30", "Custom"]
+_AUTO_TIMEOUT_UNIT_CHOICES = ["seconds", "minutes"]
+_AUTO_TIMEOUT_PRESETS = [c for c in _AUTO_TIMEOUT_VALUE_CHOICES if c != "Custom"]
+
+
+def _seconds_to_value_unit(seconds: int) -> tuple[str, str, int]:
+    """Best-effort mapping of a stored AUTO_DOWNLOAD_DISABLE_SECONDS value
+    back to a (display_value, unit, numeric_value) dropdown triple. Values
+    that don't match a preset round-trip exactly via "Custom" + the numeric
+    value (for the custom spin box), instead of being lost. Callers handle
+    seconds <= 0 (the "Off" checkbox) separately."""
+    if seconds % 60 == 0 and str(seconds // 60) in _AUTO_TIMEOUT_PRESETS:
+        return str(seconds // 60), "minutes", seconds // 60
+    if str(seconds) in _AUTO_TIMEOUT_PRESETS:
+        return str(seconds), "seconds", seconds
+    if seconds > 0 and seconds % 60 == 0:
+        return "Custom", "minutes", seconds // 60
+    return "Custom", "seconds", max(seconds, 1)
+
+
+_COOLDOWN_VALUE_CHOICES = ["5", "10", "15", "30", "60", "Custom"]
+_COOLDOWN_UNIT_CHOICES = ["minutes", "hours"]
+_COOLDOWN_PRESETS = [c for c in _COOLDOWN_VALUE_CHOICES if c != "Custom"]
+
+
+def _seconds_to_cooldown_value_unit(seconds: int) -> tuple[str, str, int]:
+    """Same idea as _seconds_to_value_unit, but for the auto-re-enable
+    cooldown's longer scale (minutes/hours instead of seconds/minutes)."""
+    if seconds % 3600 == 0 and str(seconds // 3600) in _COOLDOWN_PRESETS:
+        return str(seconds // 3600), "hours", seconds // 3600
+    if seconds % 60 == 0 and str(seconds // 60) in _COOLDOWN_PRESETS:
+        return str(seconds // 60), "minutes", seconds // 60
+    if seconds % 3600 == 0:
+        return "Custom", "hours", seconds // 3600
+    if seconds % 60 == 0:
+        return "Custom", "minutes", seconds // 60
+    return "Custom", "minutes", max(seconds // 60, 1)
 
 
 class SettingsDialog(QDialog):
@@ -912,11 +1138,14 @@ class SettingsDialog(QDialog):
     uncluttered."""
 
     settings_changed = Signal()
+    cookie_access_confirmed_broken = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(480)
+        self._cookie_probe_cache: dict[str, bool] = {}  # real_browser -> accessible
+        self._cookie_probe_worker = None
 
         form = QFormLayout(self)
 
@@ -943,26 +1172,111 @@ class SettingsDialog(QDialog):
         quality_row.addStretch(1)
         form.addRow("Video quality:", quality_row)
 
+        # ── Auto-restart short-download protection ──
+        self.auto_timeout_value_combo = QComboBox()
+        self.auto_timeout_value_combo.addItems(_AUTO_TIMEOUT_VALUE_CHOICES)
+        self.auto_timeout_custom_spin = QSpinBox()
+        self.auto_timeout_custom_spin.setRange(1, 999)
+        self.auto_timeout_custom_spin.setVisible(False)
+        self.auto_timeout_unit_combo = QComboBox()
+        self.auto_timeout_unit_combo.addItems(_AUTO_TIMEOUT_UNIT_CHOICES)
+        self.auto_timeout_off_check = QCheckBox("Off")
+        timeout_row = QHBoxLayout()
+        timeout_row.addWidget(self.auto_timeout_value_combo)
+        timeout_row.addWidget(self.auto_timeout_custom_spin)
+        timeout_row.addWidget(self.auto_timeout_unit_combo)
+        timeout_row.addWidget(self.auto_timeout_off_check)
+        timeout_row.addStretch(1)
+        form.addRow("Disable auto-restart if shorter than:", timeout_row)
+
+        timeout_hint = QLabel(
+            "If a stream's auto-restarted recording ends before this much time has\n"
+            "passed, auto-restart is temporarily disabled for it (protects against a\n"
+            "restart-loop on flaky streams). Check \"Off\" to disable this protection entirely."
+        )
+        timeout_hint.setStyleSheet("color: #888; font-size: 11px;")
+        form.addRow("", timeout_hint)
+
+        # ── Auto re-enable cooldown ──
+        self.cooldown_value_combo = QComboBox()
+        self.cooldown_value_combo.addItems(_COOLDOWN_VALUE_CHOICES)
+        self.cooldown_custom_spin = QSpinBox()
+        self.cooldown_custom_spin.setRange(1, 999)
+        self.cooldown_custom_spin.setVisible(False)
+        self.cooldown_unit_combo = QComboBox()
+        self.cooldown_unit_combo.addItems(_COOLDOWN_UNIT_CHOICES)
+        self.cooldown_off_check = QCheckBox("Off")
+        cooldown_row = QHBoxLayout()
+        cooldown_row.addWidget(self.cooldown_value_combo)
+        cooldown_row.addWidget(self.cooldown_custom_spin)
+        cooldown_row.addWidget(self.cooldown_unit_combo)
+        cooldown_row.addWidget(self.cooldown_off_check)
+        cooldown_row.addStretch(1)
+        form.addRow("Auto re-enable after:", cooldown_row)
+
+        cooldown_hint = QLabel(
+            "Once auto-restart gets disabled for a flaky stream (above), automatically\n"
+            "re-enable it after this much time — gives the stream a chance to settle\n"
+            "before retrying. \"Off\" (default) means re-checking Auto yourself instead."
+        )
+        cooldown_hint.setStyleSheet("color: #888; font-size: 11px;")
+        form.addRow("", cooldown_hint)
+
         # ── Cookies (always on — no toggle, just where to read them from) ──
         self.browser_combo = QComboBox()
-        self.browser_combo.addItems(_BROWSER_CHOICES)
-        self.cookie_path_input = QLineEdit()
-        self.cookie_path_input.setPlaceholderText("Profile folder (leave blank for the default profile)")
-        cookie_browse = QPushButton("Browse…")
-        cookie_browse.clicked.connect(self._browse_cookies)
+        self.browser_combo.addItems(_BROWSER_TOP_CHOICES)
+        self.firefox_variant_combo = QComboBox()
+        self.firefox_variant_combo.addItems(_FIREFOX_VARIANT_CHOICES)
+        self._cookie_path = ""
+        self._cookie_path_btn = QPushButton("Browse…")
+        self._cookie_path_btn.clicked.connect(self._browse_cookies)
         cookie_row = QHBoxLayout()
         cookie_row.addWidget(self.browser_combo)
-        cookie_row.addWidget(self.cookie_path_input, 1)
-        cookie_row.addWidget(cookie_browse)
+        cookie_row.addWidget(self.firefox_variant_combo)
+        cookie_row.addWidget(self._cookie_path_btn, 1)
         form.addRow("Cookie source:", cookie_row)
 
+        self.fork_detect_warning = QLabel(
+            "⚠ Couldn't auto-detect this browser's profile on this system — use Browse to point at it manually."
+        )
+        self.fork_detect_warning.setStyleSheet("color: #FF9800; font-size: 11px;")
+        self.fork_detect_warning.setVisible(False)
+        form.addRow("", self.fork_detect_warning)
+
         cookie_hint = QLabel(
-            "Cookies are always used — most streams need them now. Pick which browser,\n"
-            "and if it's a Firefox-based browser not in the list (Floorp, Zen, LibreWolf…),\n"
-            "browse to its profile folder directly."
+            "Cookies are always used — most streams need them now. Pick your browser —\n"
+            "for Firefox-based, Floorp/Zen/LibreWolf auto-detect their profile with no\n"
+            "path needed; pick \"Other\" there (or Browse for any other browser) to\n"
+            "point at a profile folder directly. Leave on Browse for the default profile."
         )
         cookie_hint.setStyleSheet("color: #888; font-size: 11px;")
         form.addRow("", cookie_hint)
+
+        # ── Cookies file fallback (Chromium browsers on Windows only) ──
+        self._cookies_file = ""
+        self._cookies_file_btn = QPushButton("Browse…")
+        self._cookies_file_btn.clicked.connect(self._browse_cookies_file)
+        self._cookies_file_clear_btn = QPushButton("✕")
+        self._cookies_file_clear_btn.setFixedWidth(28)
+        self._cookies_file_clear_btn.clicked.connect(self._clear_cookies_file)
+        self._cookies_file_clear_btn.setVisible(False)
+        cookies_file_row = QHBoxLayout()
+        cookies_file_row.addWidget(self._cookies_file_btn, 1)
+        cookies_file_row.addWidget(self._cookies_file_clear_btn)
+        self._cookies_file_label = QLabel("Cookies file:")
+        form.addRow(self._cookies_file_label, cookies_file_row)
+
+        self._cookies_file_hint = QLabel(
+            "Optional fallback for Chrome/Edge/Brave/Opera on Windows, where browser<br>"
+            "cookie access can fail (a known Windows-only Chromium limitation). See<br>"
+            "<a href=\"https://github.com/Tazir709/stream-monitor#-exporting-cookies\">"
+            "Exporting cookies</a> in the README for how to get a cookies.txt file,<br>"
+            "then select it here to use it instead of live browser extraction."
+        )
+        self._cookies_file_hint.setTextFormat(Qt.TextFormat.RichText)
+        self._cookies_file_hint.setOpenExternalLinks(True)
+        self._cookies_file_hint.setStyleSheet("color: #888; font-size: 11px;")
+        form.addRow("", self._cookies_file_hint)
 
         # ── User-Agent ──
         self.user_agent_input = QLineEdit()
@@ -988,8 +1302,16 @@ class SettingsDialog(QDialog):
         self.out_input.textChanged.connect(self._on_output_changed)
         self.resolution_combo.currentTextChanged.connect(self._on_resolution_changed)
         self.fps_combo.currentTextChanged.connect(self._on_fps_changed)
+        self.auto_timeout_value_combo.currentTextChanged.connect(self._on_auto_timeout_changed)
+        self.auto_timeout_unit_combo.currentTextChanged.connect(self._on_auto_timeout_changed)
+        self.auto_timeout_custom_spin.valueChanged.connect(self._on_auto_timeout_changed)
+        self.auto_timeout_off_check.toggled.connect(self._on_auto_timeout_changed)
+        self.cooldown_value_combo.currentTextChanged.connect(self._on_cooldown_changed)
+        self.cooldown_unit_combo.currentTextChanged.connect(self._on_cooldown_changed)
+        self.cooldown_custom_spin.valueChanged.connect(self._on_cooldown_changed)
+        self.cooldown_off_check.toggled.connect(self._on_cooldown_changed)
         self.browser_combo.currentTextChanged.connect(self._on_cookie_source_changed)
-        self.cookie_path_input.textChanged.connect(self._on_cookie_source_changed)
+        self.firefox_variant_combo.currentTextChanged.connect(self._on_firefox_variant_changed)
         self.user_agent_input.textChanged.connect(self._on_user_agent_changed)
 
     def _load_from_globals(self):
@@ -998,11 +1320,46 @@ class SettingsDialog(QDialog):
             self.resolution_combo.setCurrentText(MAX_DOWNLOAD_RESOLUTION)
         if str(MAX_DOWNLOAD_FPS) in _FPS_CHOICES:
             self.fps_combo.setCurrentText(str(MAX_DOWNLOAD_FPS))
+        is_off = AUTO_DOWNLOAD_DISABLE_SECONDS <= 0
+        self.auto_timeout_off_check.setChecked(is_off)
+        value, unit, numeric = _seconds_to_value_unit(
+            AUTO_DOWNLOAD_DISABLE_SECONDS if not is_off else 300
+        )
+        self.auto_timeout_value_combo.setCurrentText(value)
+        self.auto_timeout_unit_combo.setCurrentText(unit)
+        self.auto_timeout_value_combo.setEnabled(not is_off)
+        self.auto_timeout_unit_combo.setEnabled(not is_off)
+        if value == "Custom":
+            self.auto_timeout_custom_spin.setValue(numeric)
+        self.auto_timeout_custom_spin.setVisible(value == "Custom")
+        self.auto_timeout_custom_spin.setEnabled(not is_off)
+        is_cooldown_off = AUTO_REENABLE_COOLDOWN_SECONDS <= 0
+        self.cooldown_off_check.setChecked(is_cooldown_off)
+        c_value, c_unit, c_numeric = _seconds_to_cooldown_value_unit(
+            AUTO_REENABLE_COOLDOWN_SECONDS if not is_cooldown_off else 1800
+        )
+        self.cooldown_value_combo.setCurrentText(c_value)
+        self.cooldown_unit_combo.setCurrentText(c_unit)
+        self.cooldown_value_combo.setEnabled(not is_cooldown_off)
+        self.cooldown_unit_combo.setEnabled(not is_cooldown_off)
+        if c_value == "Custom":
+            self.cooldown_custom_spin.setValue(c_numeric)
+        self.cooldown_custom_spin.setVisible(c_value == "Custom")
+        self.cooldown_custom_spin.setEnabled(not is_cooldown_off)
         self.user_agent_input.setText(USER_AGENT)
         browser, _, path = BROWSER.partition(":")
-        if browser in _BROWSER_CHOICES:
-            self.browser_combo.setCurrentText(browser)
-        self.cookie_path_input.setText(path)
+        if browser == "firefox":
+            self.browser_combo.setCurrentText("Firefox-based")
+            if BROWSER_DISPLAY in _FIREFOX_FORK_BASE_DIRS:
+                self.firefox_variant_combo.setCurrentText(BROWSER_DISPLAY)
+            elif path:
+                self.firefox_variant_combo.setCurrentText("Other (browse manually)")
+            else:
+                self.firefox_variant_combo.setCurrentText("Firefox")
+        elif browser in _BROWSER_CHOICES:
+            self.browser_combo.setCurrentText(_BROWSER_DISPLAY_NAMES.get(browser, browser))
+        self._set_cookie_path(path)
+        self._set_cookies_file(COOKIES_FILE)
         self._on_cookie_source_changed()
 
     def _on_output_changed(self, text: str):
@@ -1020,6 +1377,41 @@ class SettingsDialog(QDialog):
         MAX_DOWNLOAD_FPS = int(text)
         self.settings_changed.emit()
 
+    def _on_auto_timeout_changed(self, _=None):
+        global AUTO_DOWNLOAD_DISABLE_SECONDS
+        is_off = self.auto_timeout_off_check.isChecked()
+        unit = self.auto_timeout_unit_combo.currentText()
+        selected = self.auto_timeout_value_combo.currentText()
+        self.auto_timeout_value_combo.setEnabled(not is_off)
+        self.auto_timeout_unit_combo.setEnabled(not is_off)
+        self.auto_timeout_custom_spin.setVisible(selected == "Custom")
+        self.auto_timeout_custom_spin.setEnabled(not is_off)
+        if is_off:
+            AUTO_DOWNLOAD_DISABLE_SECONDS = 0
+        else:
+            if selected == "Custom":
+                value = self.auto_timeout_custom_spin.value()
+            else:
+                value = int(selected)
+            AUTO_DOWNLOAD_DISABLE_SECONDS = value * 60 if unit == "minutes" else value
+        self.settings_changed.emit()
+
+    def _on_cooldown_changed(self, _=None):
+        global AUTO_REENABLE_COOLDOWN_SECONDS
+        is_off = self.cooldown_off_check.isChecked()
+        unit = self.cooldown_unit_combo.currentText()
+        selected = self.cooldown_value_combo.currentText()
+        self.cooldown_value_combo.setEnabled(not is_off)
+        self.cooldown_unit_combo.setEnabled(not is_off)
+        self.cooldown_custom_spin.setVisible(selected == "Custom")
+        self.cooldown_custom_spin.setEnabled(not is_off)
+        if is_off:
+            AUTO_REENABLE_COOLDOWN_SECONDS = 0
+        else:
+            value = self.cooldown_custom_spin.value() if selected == "Custom" else int(selected)
+            AUTO_REENABLE_COOLDOWN_SECONDS = value * 3600 if unit == "hours" else value * 60
+        self.settings_changed.emit()
+
     def _browse_output(self):
         # No parent, so the dialog doesn't inherit the app's dark
         # stylesheet — the global QLineEdit padding rule clips text in the
@@ -1031,6 +1423,21 @@ class SettingsDialog(QDialog):
         if folder:
             self.out_input.setText(folder)
 
+    def _set_cookie_path(self, path: str):
+        """Drives the single Browse button's display: shows "Browse…" when
+        no path is set, or the (elided, full path in the tooltip) path
+        itself once one is — instead of a separate always-visible text box
+        squashed next to the button."""
+        self._cookie_path = (path or "").strip()
+        if self._cookie_path:
+            metrics = self._cookie_path_btn.fontMetrics()
+            elided = metrics.elidedText(self._cookie_path, Qt.TextElideMode.ElideMiddle, 260)
+            self._cookie_path_btn.setText(elided)
+            self._cookie_path_btn.setToolTip(self._cookie_path)
+        else:
+            self._cookie_path_btn.setText("Browse…")
+            self._cookie_path_btn.setToolTip("")
+
     def _browse_cookies(self):
         # Browser profile dirs are almost always dotfolders (~/.mozilla,
         # ~/.floorp, …). The native Linux picker hides those by default and
@@ -1039,7 +1446,7 @@ class SettingsDialog(QDialog):
         # stylesheet-leak reason as _browse_output above.
         dialog = QFileDialog(
             None, "Choose browser profile folder",
-            self.cookie_path_input.text() or os.path.expanduser("~"),
+            self._cookie_path or os.path.expanduser("~"),
         )
         dialog.setFileMode(QFileDialog.FileMode.Directory)
         dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
@@ -1048,13 +1455,111 @@ class SettingsDialog(QDialog):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             selected = dialog.selectedFiles()
             if selected:
-                self.cookie_path_input.setText(selected[0])
+                self._set_cookie_path(selected[0])
+                self._on_cookie_source_changed()
+
+    def _set_cookies_file(self, path: str):
+        self._cookies_file = (path or "").strip()
+        if self._cookies_file:
+            metrics = self._cookies_file_btn.fontMetrics()
+            elided = metrics.elidedText(self._cookies_file, Qt.TextElideMode.ElideMiddle, 220)
+            self._cookies_file_btn.setText(elided)
+            self._cookies_file_btn.setToolTip(self._cookies_file)
+        else:
+            self._cookies_file_btn.setText("Browse…")
+            self._cookies_file_btn.setToolTip("")
+        self._cookies_file_clear_btn.setVisible(bool(self._cookies_file) and self._cookies_file_label.isVisible())
+
+    def _browse_cookies_file(self):
+        # No parent, same stylesheet-leak reason as _browse_output/_browse_cookies.
+        path, _ = QFileDialog.getOpenFileName(
+            None, "Choose cookies.txt file",
+            self._cookies_file or os.path.expanduser("~"),
+            "Cookies file (*.txt);;All files (*)",
+        )
+        if path:
+            self._set_cookies_file(path)
+            self._on_cookie_source_changed()
+
+    def _clear_cookies_file(self):
+        self._set_cookies_file("")
+        self._on_cookie_source_changed()
+
+    def _set_cookies_file_row_visible(self, visible: bool):
+        self._cookies_file_label.setVisible(visible)
+        self._cookies_file_btn.setVisible(visible)
+        self._cookies_file_hint.setVisible(visible)
+        self._cookies_file_clear_btn.setVisible(visible and bool(self._cookies_file))
+
+    def _maybe_probe_cookie_access(self, real_browser: str):
+        if real_browser in self._cookie_probe_cache:
+            return
+        self._cookie_probe_worker = CookieProbeWorker(real_browser)
+        self._cookie_probe_worker.result_signal.connect(self._on_cookie_probe_result)
+        self._cookie_probe_worker.start()
+
+    def _on_cookie_probe_result(self, real_browser: str, accessible: bool):
+        self._cookie_probe_cache[real_browser] = accessible
+        top = self.browser_combo.currentText()
+        if _BROWSER_DISPLAY_TO_REAL.get(top, top) != real_browser:
+            return  # user switched away before this finished -- stale, ignore
+        if not accessible:
+            self._set_cookies_file_row_visible(True)
+            self.cookie_access_confirmed_broken.emit()
+
+    def _on_firefox_variant_changed(self, variant):
+        if variant in _FIREFOX_FORK_BASE_DIRS:
+            self._set_cookie_path(_detect_fork_default_profile(variant))
+        else:
+            # "Firefox" (auto-resolved by yt-dlp) or "Other" (needs a fresh
+            # manual pick) -- don't carry over a previous variant's path.
+            self._set_cookie_path("")
+        self._on_cookie_source_changed()
 
     def _on_cookie_source_changed(self, _=None):
-        global BROWSER
-        path = self.cookie_path_input.text().strip()
-        browser = self.browser_combo.currentText()
-        BROWSER = f"{browser}:{path}" if path else browser
+        global BROWSER, BROWSER_DISPLAY, COOKIES_FILE
+        COOKIES_FILE = self._cookies_file
+        top = self.browser_combo.currentText()
+        is_firefox_based = (top == "Firefox-based")
+        self.firefox_variant_combo.setVisible(is_firefox_based)
+
+        if not is_firefox_based:
+            # A plain, directly-supported browser -- yt-dlp resolves its
+            # profile on its own, nothing for the user to see or do.
+            self.fork_detect_warning.setVisible(False)
+            self._cookie_path_btn.setVisible(False)
+            real_browser = _BROWSER_DISPLAY_TO_REAL.get(top, top)
+            is_chromium_windows = sys.platform == "win32" and real_browser in _CHROMIUM_BROWSERS
+            if is_chromium_windows and self._cookies_file:
+                # Already configured (e.g. restored from streams.json) --
+                # always show it regardless of probe state, so it stays
+                # manageable/clearable.
+                self._set_cookies_file_row_visible(True)
+            elif is_chromium_windows and self._cookie_probe_cache.get(real_browser) is False:
+                self._set_cookies_file_row_visible(True)
+            else:
+                self._set_cookies_file_row_visible(False)
+            if is_chromium_windows and not self._cookies_file:
+                self._maybe_probe_cookie_access(real_browser)
+            BROWSER_DISPLAY = ""
+            BROWSER = f"{real_browser}:{self._cookie_path}" if self._cookie_path else real_browser
+            self.settings_changed.emit()
+            return
+
+        self._set_cookies_file_row_visible(False)
+        variant = self.firefox_variant_combo.currentText()
+        is_known_fork = variant in _FIREFOX_FORK_BASE_DIRS
+        is_other = variant == "Other (browse manually)"
+        detection_failed = is_known_fork and not self._cookie_path
+
+        self.fork_detect_warning.setVisible(detection_failed)
+        # Only show the button when the user actually has to do something:
+        # they picked "Other", or a known fork's auto-detection failed.
+        # Plain "Firefox" and a successfully-resolved fork show nothing.
+        self._cookie_path_btn.setVisible(is_other or detection_failed)
+
+        BROWSER_DISPLAY = variant if is_known_fork else ""
+        BROWSER = f"firefox:{self._cookie_path}" if self._cookie_path else "firefox"
         self.settings_changed.emit()
 
     def _on_user_agent_changed(self, text: str):
@@ -1091,6 +1596,9 @@ class StreamDownloaderGUI(QMainWindow):
         self.download_timers: Dict[str, DownloadTimer]   = {}
         self.stream_items: Dict[str, StreamItem]         = {}
         self.auto_checkboxes: Dict[str, QCheckBox] = {}
+        self._auto_disabled: Dict[str, str] = {}  # url -> username, for the disabled-auto-restart banner
+        self._reenable_timers: Dict[str, QTimer] = {}
+        self._shown_chromium_cookie_dialog = False
 
         # Process health check
         self._proc_timer = QTimer(self)
@@ -1099,6 +1607,7 @@ class StreamDownloaderGUI(QMainWindow):
 
         self._settings_dialog = SettingsDialog(self)
         self._settings_dialog.settings_changed.connect(self._save)
+        self._settings_dialog.cookie_access_confirmed_broken.connect(self._maybe_show_chromium_cookie_dialog)
 
         # Convenience references so the rest of the class can keep reading
         # these the same way it always has, without caring that they now
@@ -1149,15 +1658,79 @@ class StreamDownloaderGUI(QMainWindow):
             MAX_DOWNLOAD_FPS = int(saved_fps)
             self._settings_dialog.fps_combo.setCurrentText(saved_fps)
 
+        saved_auto_timeout = settings.get("auto_timeout_seconds", None)
+        if saved_auto_timeout is not None:
+            try:
+                saved_auto_timeout = int(saved_auto_timeout)
+            except (TypeError, ValueError):
+                saved_auto_timeout = None
+        if saved_auto_timeout is not None:
+            global AUTO_DOWNLOAD_DISABLE_SECONDS
+            AUTO_DOWNLOAD_DISABLE_SECONDS = saved_auto_timeout
+            is_off = AUTO_DOWNLOAD_DISABLE_SECONDS <= 0
+            self._settings_dialog.auto_timeout_off_check.setChecked(is_off)
+            value, unit, numeric = _seconds_to_value_unit(
+                AUTO_DOWNLOAD_DISABLE_SECONDS if not is_off else 300
+            )
+            self._settings_dialog.auto_timeout_value_combo.setCurrentText(value)
+            self._settings_dialog.auto_timeout_unit_combo.setCurrentText(unit)
+            self._settings_dialog.auto_timeout_value_combo.setEnabled(not is_off)
+            self._settings_dialog.auto_timeout_unit_combo.setEnabled(not is_off)
+            if value == "Custom":
+                self._settings_dialog.auto_timeout_custom_spin.setValue(numeric)
+            self._settings_dialog.auto_timeout_custom_spin.setVisible(value == "Custom")
+            self._settings_dialog.auto_timeout_custom_spin.setEnabled(not is_off)
+
+        saved_cooldown = settings.get("auto_reenable_cooldown_seconds", None)
+        if saved_cooldown is not None:
+            try:
+                saved_cooldown = int(saved_cooldown)
+            except (TypeError, ValueError):
+                saved_cooldown = None
+        if saved_cooldown is not None:
+            global AUTO_REENABLE_COOLDOWN_SECONDS
+            AUTO_REENABLE_COOLDOWN_SECONDS = saved_cooldown
+            is_cooldown_off = AUTO_REENABLE_COOLDOWN_SECONDS <= 0
+            self._settings_dialog.cooldown_off_check.setChecked(is_cooldown_off)
+            c_value, c_unit, c_numeric = _seconds_to_cooldown_value_unit(
+                AUTO_REENABLE_COOLDOWN_SECONDS if not is_cooldown_off else 1800
+            )
+            self._settings_dialog.cooldown_value_combo.setCurrentText(c_value)
+            self._settings_dialog.cooldown_unit_combo.setCurrentText(c_unit)
+            self._settings_dialog.cooldown_value_combo.setEnabled(not is_cooldown_off)
+            self._settings_dialog.cooldown_unit_combo.setEnabled(not is_cooldown_off)
+            if c_value == "Custom":
+                self._settings_dialog.cooldown_custom_spin.setValue(c_numeric)
+            self._settings_dialog.cooldown_custom_spin.setVisible(c_value == "Custom")
+            self._settings_dialog.cooldown_custom_spin.setEnabled(not is_cooldown_off)
+
+        saved_cookies_file = str(settings.get("cookies_file", "") or "").strip()
+        if saved_cookies_file and os.path.isfile(saved_cookies_file):
+            global COOKIES_FILE
+            COOKIES_FILE = saved_cookies_file
+            self._settings_dialog._set_cookies_file(saved_cookies_file)
+
         saved_browser = str(settings.get("browser", "") or "").strip()
+        saved_browser_display = str(settings.get("browser_display", "") or "").strip()
         if saved_browser:
             browser, _, path = saved_browser.partition(":")
             if browser in _BROWSER_CHOICES:
                 if not path or os.path.isdir(path):
-                    global BROWSER
+                    global BROWSER, BROWSER_DISPLAY
                     BROWSER = saved_browser
-                    self._settings_dialog.browser_combo.setCurrentText(browser)
-                    self._settings_dialog.cookie_path_input.setText(path)
+                    BROWSER_DISPLAY = saved_browser_display if saved_browser_display in _FIREFOX_FORK_BASE_DIRS else ""
+                    if browser == "firefox":
+                        self._settings_dialog.browser_combo.setCurrentText("Firefox-based")
+                        if BROWSER_DISPLAY:
+                            self._settings_dialog.firefox_variant_combo.setCurrentText(BROWSER_DISPLAY)
+                        elif path:
+                            self._settings_dialog.firefox_variant_combo.setCurrentText("Other (browse manually)")
+                        else:
+                            self._settings_dialog.firefox_variant_combo.setCurrentText("Firefox")
+                    else:
+                        self._settings_dialog.browser_combo.setCurrentText(_BROWSER_DISPLAY_NAMES.get(browser, browser))
+                    self._settings_dialog._set_cookie_path(path)
+                    self._settings_dialog._on_cookie_source_changed()
 
         for entry in saved.get("streams", []):
             url = entry["url"]
@@ -1178,6 +1751,28 @@ class StreamDownloaderGUI(QMainWindow):
         self._settings_dialog.show()
         self._settings_dialog.raise_()
         self._settings_dialog.activateWindow()
+
+    def _maybe_show_chromium_cookie_dialog(self):
+        if not self._shown_chromium_cookie_dialog:
+            self._shown_chromium_cookie_dialog = True
+            self._show_chromium_cookie_dialog()
+
+    def _show_chromium_cookie_dialog(self):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Chromium Cookie Access Issue")
+        box.setText(
+            "Chrome and other Chromium-based browsers (Edge, Brave, Opera) can fail "
+            "to give yt-dlp reliable cookie access on Windows — this is a known "
+            "limitation in Chrome itself, not a bug in Stream Monitor.\n\n"
+            "Click below for how to fix it: export your cookies to a file, or "
+            "switch to a Firefox-based browser."
+        )
+        open_btn = box.addButton("Open Troubleshooting Guide", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() == open_btn:
+            QDesktopServices.openUrl(QUrl("https://github.com/Tazir709/stream-monitor#-troubleshooting"))
 
     # ── UI construction ─────────────────────────
 
@@ -1213,6 +1808,16 @@ class StreamDownloaderGUI(QMainWindow):
         bar.addWidget(stop_all_btn)
 
         vbox.addLayout(bar)
+
+        # ── Auto-restart-disabled banner (hidden until it has something to say) ──
+        self._auto_disabled_banner = QLabel()
+        self._auto_disabled_banner.setWordWrap(True)
+        self._auto_disabled_banner.setStyleSheet(
+            "background:#3a2a10; color:#FF9800; font-size:12px; font-weight:bold;"
+            "padding:6px 10px; border-radius:4px; border:1px solid #FF9800;"
+        )
+        self._auto_disabled_banner.setVisible(False)
+        vbox.addWidget(self._auto_disabled_banner)
 
         # ── Splitter: table / log ──
         splitter = QSplitter(Qt.Vertical)
@@ -1403,8 +2008,14 @@ class StreamDownloaderGUI(QMainWindow):
             f"{'✅' if checked else '❌'} Auto-start {item.username}: {'ON' if checked else 'OFF'}",
             "#FF9800" if checked else "#777"
         )
-        if checked and item.current_status == StreamStatus.ONLINE and not item.download_active:
-            self._manual_start(url)
+        if checked:
+            old = self._reenable_timers.pop(url, None)
+            if old:
+                old.stop()
+            if self._auto_disabled.pop(url, None) is not None:
+                self._update_auto_disabled_banner()
+            if item.current_status == StreamStatus.ONLINE and not item.download_active:
+                self._manual_start(url)
 
     def _manual_start(self, url: str):
         worker = self.download_workers.get(url)
@@ -1472,6 +2083,11 @@ class StreamDownloaderGUI(QMainWindow):
 
         self.download_timers.pop(url, None)
         self.auto_checkboxes.pop(url, None)
+        old_timer = self._reenable_timers.pop(url, None)
+        if old_timer:
+            old_timer.stop()
+        if self._auto_disabled.pop(url, None) is not None:
+            self._update_auto_disabled_banner()
         del self.stream_items[url]
 
         for u, si in self.stream_items.items():
@@ -1501,6 +2117,9 @@ class StreamDownloaderGUI(QMainWindow):
         old = item.current_status
         item.current_status = status
         item.last_check_time = time.time()
+
+        if status == StreamStatus.ERROR and message == CHROMIUM_COOKIE_ERROR_MSG:
+            self._maybe_show_chromium_cookie_dialog()
 
         # If the last download ended early, this fresh check tells us whether
         # it was a normal end (offline) or a flaky-connection drop (still online).
@@ -1605,6 +2224,43 @@ class StreamDownloaderGUI(QMainWindow):
                 f"⚠ Auto-start disabled for {item.username}: download ended unexpectedly while stream was still live",
                 "#FF9800"
             )
+            self._auto_disabled[url] = item.username
+            self._update_auto_disabled_banner()
+            if AUTO_REENABLE_COOLDOWN_SECONDS > 0:
+                self._start_reenable_cooldown(url)
+
+    def _start_reenable_cooldown(self, url: str):
+        old = self._reenable_timers.pop(url, None)
+        if old:
+            old.stop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: self._reenable_after_cooldown(url))
+        timer.start(AUTO_REENABLE_COOLDOWN_SECONDS * 1000)
+        self._reenable_timers[url] = timer
+
+    def _reenable_after_cooldown(self, url: str):
+        self._reenable_timers.pop(url, None)
+        item = self.stream_items.get(url)
+        if not item or item.auto_start:
+            return  # removed, or already manually re-enabled before this fired
+        cb = self.auto_checkboxes.get(url)
+        if cb:
+            self._log_msg(
+                f"⏰ Cooldown elapsed for {item.username}, re-enabling Auto-restart",
+                "#4CAF50"
+            )
+            cb.setChecked(True)  # triggers _toggle_auto(url, True) via the existing signal
+
+    def _update_auto_disabled_banner(self):
+        if not self._auto_disabled:
+            self._auto_disabled_banner.setVisible(False)
+            return
+        names = ", ".join(self._auto_disabled.values())
+        self._auto_disabled_banner.setText(
+            f"⚠ Auto-restart disabled for: {names} — re-check Auto on each to resume"
+        )
+        self._auto_disabled_banner.setVisible(True)
 
     def _on_dl_finished(self, url: str):
         item = self.stream_items.get(url)
