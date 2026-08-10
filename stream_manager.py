@@ -155,7 +155,14 @@ def log_exception(prefix: str) -> None:
 
 def format_error_message(stderr: str, stdout: str = "") -> str:
     text = f"{stderr}\n{stdout}".lower()
-    
+
+    if "could not copy chrome cookie database" in text:
+        return (
+            "Could not access Chromium cookies. "
+            "See https://github.com/yt-dlp/yt-dlp/issues/7271 "
+            "for ways to fix Chromium cookie access, or try a different browser. "
+            "(yt-dlp/Chromium cookie access issue on Windows)"
+        )
     if "403" in text or "forbidden" in text or "access denied" in text:
         return "🚫 Access blocked (403). Try setting a User-Agent or enabling cookies."
     if "age restricted" in text or "age-restricted" in text:
