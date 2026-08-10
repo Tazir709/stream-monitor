@@ -148,6 +148,20 @@ def _find_tool(name: str) -> str:
     return shutil.which(name) or name
 
 
+def _subprocess_kwargs() -> dict:
+    """Return Windows-specific subprocess options to keep console
+    windows hidden when launching console applications from the GUI.
+
+    This matters specifically because the app is normally launched
+    without a console, but tools such as yt-dlp and ffmpeg are console
+    applications and would otherwise briefly open a window on Windows.
+    """
+    kwargs: dict = {}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return kwargs
+
+
 YTDLP_PATH = _find_tool("yt-dlp")
 FFMPEG_PATH = _find_tool("ffmpeg")
 
@@ -258,7 +272,13 @@ class CookieProbeWorker(QThread):
         accessible = True
         try:
             cmd = [YTDLP_PATH, "--cookies-from-browser", self.real_browser, "--cookies", tmp_path]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                **_subprocess_kwargs(),
+            )
             text = f"{r.stderr}\n{r.stdout}".lower()
             if "could not copy chrome cookie database" in text or "failed to decrypt with dpapi" in text:
                 accessible = False
@@ -351,7 +371,10 @@ class SharedPreviewWorker(QThread):
             cmd.append(page_url)
             r = subprocess.run(
                 cmd,
-                capture_output=True, text=True, timeout=30
+                capture_output=True,
+                text=True,
+                timeout=30,
+                **_subprocess_kwargs(),
             )
             if r.returncode == 0 and r.stdout.strip():
                 url = r.stdout.strip().split("\n")[0]
@@ -515,7 +538,10 @@ class DownloadWorker(QThread):
             cmd.append(self.stream_url)
             r = subprocess.run(
                 cmd,
-                capture_output=True, text=True, timeout=20,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                **_subprocess_kwargs(),
             )
             if r.returncode == 0:
                 res = r.stdout.strip().split("\n")[0]
@@ -583,7 +609,10 @@ class DownloadWorker(QThread):
                 universal_newlines=True,
             )
             if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                kwargs["creationflags"] = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP |
+                    subprocess.CREATE_NO_WINDOW
+                )
 
             self.process = subprocess.Popen(cmd, **kwargs)
             self.is_running = True
@@ -772,7 +801,10 @@ class StreamChecker(QThread):
             cmd.append(url)
             r = subprocess.run(
                 cmd,
-                capture_output=True, text=True, timeout=30,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                **_subprocess_kwargs(),
             )
             stdout = r.stdout.strip().lower()
             stderr = r.stderr.lower()
