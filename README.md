@@ -200,11 +200,10 @@ Downloads/
 
 **App window doesn't seem to open** — A successful launch prints nothing to the terminal at all (this is normal Qt behavior), so check for a new window rather than assuming it crashed. If it genuinely doesn't start, run it from a terminal to see the actual traceback.
 
-*Windows-specific:* If double-clicking stream_manager.py does nothing, your .py file association may be pointing to a different Python launcher or interpreter. Right-click stream_manager.py → Open with → Choose another app → Choose an app on your PC, then select the actual Python interpreter used to run Stream Monitor.
-
-For a typical per-user Python installation, this will look like: `C:\Users\{username}\AppData\Local\Programs\Python\Python{version}\python.exe`
-
-You can find the installed interpreter from a terminal with: `where.exe python` Select the actual `python.exe` from your Python installation directory, rather than `py.exe` or the WindowsApps Python alias.
+*Windows-specific*: If double-clicking stream_manager.py does nothing, you can launch it directly using the project's own Python interpreter:
+1. Right-click `stream_manager.py` → **Open with** → **Choose another app** → **Choose an app on your PC**
+2. Navigate to your `stream-monitor` folder → `Stream_Venv` → `Scripts` → select **`pythonw.exe`**
+3. If desired, check **"Always use this app to open .py files"** to make future double-clicks work automatically.
 
 ---
 
