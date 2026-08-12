@@ -1177,7 +1177,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.setMinimumWidth(480)
         self._cookie_probe_cache: dict[str, bool] = {}  # real_browser -> accessible
-        self._cookie_probe_worker = None
+        self._cookie_probe_workers: Dict[str, CookieProbeWorker] = {}  # real_browser -> in-flight worker
 
         form = QFormLayout(self)
 
@@ -1526,9 +1526,13 @@ class SettingsDialog(QDialog):
     def _maybe_probe_cookie_access(self, real_browser: str):
         if real_browser in self._cookie_probe_cache:
             return
-        self._cookie_probe_worker = CookieProbeWorker(real_browser)
-        self._cookie_probe_worker.result_signal.connect(self._on_cookie_probe_result)
-        self._cookie_probe_worker.start()
+        if real_browser in self._cookie_probe_workers:
+            return  # already probing this browser, don't orphan/overwrite it
+        worker = CookieProbeWorker(real_browser)
+        worker.result_signal.connect(self._on_cookie_probe_result)
+        worker.finished.connect(lambda: self._cookie_probe_workers.pop(real_browser, None))
+        self._cookie_probe_workers[real_browser] = worker
+        worker.start()
 
     def _on_cookie_probe_result(self, real_browser: str, accessible: bool):
         self._cookie_probe_cache[real_browser] = accessible
