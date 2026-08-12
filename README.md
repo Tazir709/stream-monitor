@@ -198,9 +198,14 @@ Downloads/
 
 **A popup says Chrome/Chromium cookie access failed** — the app checks this automatically for Chrome/Edge/Brave/Opera on Windows and warns you if it fails; it's a known Chrome-on-Windows limitation, not a bug in this app, and closing the browser doesn't reliably fix it. Either export your cookies (see [Exporting cookies](#-exporting-cookies) above) and select the file in Settings' **Cookies file** row, or switch to a Firefox-based browser instead, which isn't affected.
 
-**App window doesn't seem to open** — a successful launch prints nothing to the terminal at all (this is normal Qt behavior); check for a new window rather than assuming it crashed. If it genuinely didn't start, run it from a terminal to see the actual traceback.
+**App window doesn't seem to open**
+A successful launch prints nothing to the terminal at all (this is normal Qt behavior), so check for a new window rather than assuming it crashed. If it genuinely doesn't start, run it from a terminal to see the actual traceback.
 
----
+*Windows-specific:* If double-clicking stream_manager.py does nothing, your .py file association may be pointing to a different Python launcher or interpreter. Right-click stream_manager.py → Open with → Choose another app → Choose an app on your PC, then select the actual Python interpreter used to run Stream Monitor.
+
+For a typical per-user Python installation, this will look like: `C:\Users\{username}\AppData\Local\Programs\Python\Python{version}\python.exe`
+
+You can find the installed interpreter from a terminal with: `where.exe python` Select the actual `python.exe` from your Python installation directory, rather than `py.exe` or the WindowsApps Python alias.
 
 ## ⚠️ Known limitations
 
