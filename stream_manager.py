@@ -86,13 +86,90 @@ AUTO_DOWNLOAD_DISABLE_SECONDS = 300
 # Auto-restart automatically re-checked after this many seconds.
 AUTO_REENABLE_COOLDOWN_SECONDS = 0
 
-DOWNLOAD_BITRATE_KBPS = { # Usage calculation based on 30 fps
-    "640x360": 896,
-    "960x540": 1696,
-    "1280x720": 3096,
-    "1920x1080": 5128,
-    "3840x2160": 7192,
+DOWNLOAD_BITRATE_KBPS = { # Usage calculation, per resolution, per fps bucket.
+    # 60fps entries are ~1.5x their 30fps counterpart (rough real-world
+    # H.264 ratio -- bitrate scales sublinearly with fps, not 2x).
+    "640x360":   {30: 896,  60: 1344},
+    "960x540":   {30: 1696, 60: 2544},
+    "1280x720":  {30: 3096, 60: 4644},
+    "1920x1080": {30: 5128, 60: 7692},
+    "3840x2160": {30: 7192, 60: 10788},
 }
+
+
+def get_bitrate_kbps(resolution: str, fps: int) -> int:
+    """Estimate bitrate for a resolution, even when it is not one of the
+    known exact buckets. For odd resolutions like 854x480 we scale from the
+    nearest known resolution buckets and average the result across the closest
+    bucket candidates instead of hardcoding every possible size."""
+    if not resolution:
+        return 0
+    try:
+        width, height = [int(part.strip()) for part in resolution.lower().split("x", 1)]
+    except Exception:
+        return 0
+    if width <= 0 or height <= 0:
+        return 0
+    if not fps:
+        fps = 30
+
+    exact = DOWNLOAD_BITRATE_KBPS.get(resolution)
+    if exact:
+        closest = min(exact.keys(), key=lambda k: abs(k - fps))
+        return int(exact.get(closest, 0))
+
+    target_pixels = width * height
+    candidates: list[tuple[int, int]] = []
+    for known_res, buckets in DOWNLOAD_BITRATE_KBPS.items():
+        try:
+            known_w, known_h = [int(part.strip()) for part in known_res.lower().split("x", 1)]
+        except Exception:
+            continue
+        if known_w <= 0 or known_h <= 0:
+            continue
+        known_pixels = known_w * known_h
+        candidates.append((abs(target_pixels - known_pixels), known_res, known_pixels))
+
+    if not candidates:
+        return 0
+
+    # Average the closest known-size estimates instead of assuming a single
+    # exact match, which gives sensible results for resolutions like 854x480.
+    closest = sorted(candidates, key=lambda item: item[0])[:3]
+    estimates: list[int] = []
+    for _, known_res, known_pixels in closest:
+        buckets = DOWNLOAD_BITRATE_KBPS.get(known_res, {})
+        if not buckets:
+            continue
+        if fps <= 30:
+            fps_value = 30
+        elif fps >= 60:
+            fps_value = 60
+        else:
+            fps_value = 30 + (fps - 30) * (60 - 30) / (60 - 30)
+        # Interpolate based on the nearest known fps bucket values.
+        bucket_keys = sorted(buckets.keys())
+        if fps_value <= bucket_keys[0]:
+            sample = buckets[bucket_keys[0]]
+        elif fps_value >= bucket_keys[-1]:
+            sample = buckets[bucket_keys[-1]]
+        else:
+            lower = max(k for k in bucket_keys if k <= fps_value)
+            upper = min(k for k in bucket_keys if k >= fps_value)
+            low_val = buckets[lower]
+            high_val = buckets[upper]
+            if upper == lower:
+                sample = low_val
+            else:
+                ratio = (fps_value - lower) / (upper - lower)
+                sample = int(low_val + (high_val - low_val) * ratio)
+
+        scale = target_pixels / known_pixels
+        estimates.append(int(sample * scale))
+
+    if not estimates:
+        return 0
+    return int(sum(estimates) / len(estimates))
 
 
 def get_download_format_selector() -> str:
@@ -125,6 +202,127 @@ def get_cookie_args() -> list[str]:
     if COOKIES_FILE and real_browser in _CHROMIUM_BROWSERS and os.path.isfile(COOKIES_FILE):
         return ["--cookies", COOKIES_FILE]
     return ["--cookies-from-browser", BROWSER]
+
+
+# ─────────────────────────────────────────────
+#  Per-site yt-dlp overrides
+# ─────────────────────────────────────────────
+#
+# Some sites need extra yt-dlp flags to work at all. Keyed by a substring
+# that's matched (case-insensitively) against the stream URL. Add new
+# sites here rather than sprinkling `if "sitename" in url` checks through
+# the command-building code.
+#
+# "impersonate": True means pass `--impersonate {browser_type}`, reusing
+#   whatever browser is already configured in Settings (the real_browser
+#   part of BROWSER, e.g. "firefox" out of "firefox:default-release").
+#   Set it to a specific string instead (e.g. "chrome") to force a
+#   particular impersonate target regardless of the configured browser.
+#   Used for both the check worker and the download worker.
+# "extra_args": a flat list of additional yt-dlp CLI args appended as-is,
+#   used by the download worker only (the check/probe calls stay generic).
+# "ffmpeg_extra_args": a flat list of extra ffmpeg args for the *preview*
+#   worker's capture command, inserted right after the input (-i) options,
+#   e.g. for HLS containers ffmpeg needs extra flags to demux
+#   (fmp4-in-.ts-style segments, non-standard extensions, etc).
+# "referer": the Referer header to send on the preview worker's ffmpeg
+#   capture request. Some sites 403 the HLS segments without it.
+SITE_OVERRIDES: dict[str, dict] = {
+    "chaturbate.com": {
+        "referer": "https://chaturbate.com/",
+    },
+    "camsoda.com": {
+        # Camsoda uses .hls.fmp4 segments; ffmpeg needs -allowed_extensions ALL
+        # -extension_picky 0 to demux them, and returns 403 without --impersonate.
+        "impersonate": True,
+        "extra_args": [
+            "--downloader-args", "ffmpeg_i:-extension_picky 0",
+        ],
+        "ffmpeg_extra_args": ["-allowed_extensions", "ALL", "-extension_picky", "0"],
+        "referer": "https://www.camsoda.com/",
+    },
+    "bongacams.com": {
+        # Regular .ts HLS segments; only --impersonate needed, for live checks.
+        "impersonate": True,
+    },
+
+    # "othersite.com": {
+    #     "impersonate": "chrome",  # force a specific target regardless of Settings
+    #     "extra_args": ["--some-flag", "value"],
+    #     "ffmpeg_extra_args": ["-some-ffmpeg-flag", "value"],
+    #     "referer": "https://www.othersite.com/",
+    # },
+
+    # Stripchat.com
+        # yt-dlp currently returns "Unable to extract data".
+        # Wait for a yt-dlp update before adding site-specific handling.
+
+    # cam4.com
+        # CAM4 has inconsistent handling of private/spy streams. yt-dlp can report
+        # these streams as "is_live" even when ffmpeg cannot actually access the
+        # HLS stream, causing the preview to fail or time out.
+        #
+        # CAM4 could also report HTTP 400/403 errors or JSON parsing errors for
+        # certain profiles depending on their current stream state.
+        #
+        # Auto-download required additional CAM4-specific handling so downloads
+        # would wait for a successful preview confirmation rather than starting
+        # immediately when yt-dlp reported "is_live".
+        #
+        # CAM4 support has therefore been disabled for now to avoid unreliable
+        # previews, short/incomplete downloads, and confusing status changes.
+        # Revisit this if yt-dlp or CAM4's stream handling becomes more reliable.
+}
+
+
+def _site_override(url: str) -> dict:
+    """Return the SITE_OVERRIDES entry matching `url` (by substring, case
+    insensitive), or {} if no site matches."""
+    host = (url or "").lower()
+    for site_key, cfg in SITE_OVERRIDES.items():
+        if site_key in host:
+            return cfg
+    return {}
+
+
+def _impersonate_args(cfg: dict) -> list[str]:
+    impersonate = cfg.get("impersonate")
+    if not impersonate:
+        return []
+    if impersonate is True:
+        browser_type = BROWSER.split(":", 1)[0].strip()
+    else:
+        browser_type = str(impersonate)
+    return ["--impersonate", browser_type] if browser_type else []
+
+
+def get_site_args(url: str) -> list[str]:
+    """Return extra yt-dlp CLI args (impersonate + extra_args) for whichever
+    site `url` belongs to, based on SITE_OVERRIDES. Used by the download
+    worker. Safe to call for URLs with no override configured (returns an
+    empty list)."""
+    cfg = _site_override(url)
+    return _impersonate_args(cfg) + list(cfg.get("extra_args", []))
+
+
+def get_site_check_args(url: str) -> list[str]:
+    """Return extra yt-dlp CLI args for the live-status check / URL-resolve
+    calls — currently just --impersonate where configured. Kept separate
+    from get_site_args() since checks shouldn't need the download-only
+    flags (e.g. --downloader-args)."""
+    return _impersonate_args(_site_override(url))
+
+
+def get_site_referer(url: str) -> str:
+    """Return the Referer header to use for the preview worker's ffmpeg
+    capture, or "" if none is configured for this site."""
+    return _site_override(url).get("referer", "")
+
+
+def get_site_ffmpeg_args(url: str) -> list[str]:
+    """Return extra ffmpeg args for the preview worker's capture command,
+    or [] if none is configured for this site."""
+    return list(_site_override(url).get("ffmpeg_extra_args", []))
 
 
 def _find_tool(name: str) -> str:
@@ -189,6 +387,7 @@ class StreamItem:
     last_check_time: float = 0
     download_start_time: float = 0
     resolution: str = ""
+    fps: int = 30  # best-known fps for `resolution` -- probe-based until the live output reveals the real value
     pending_short_check: bool = False  # last download ended early; awaiting post-download status to decide on auto-disable
 
 
@@ -215,6 +414,32 @@ def extract_username(url: str) -> str:
     url = url.rstrip("/")
     match = re.search(r'(?:https?://)?[^/]+/([^/?#]+)', url)
     return match.group(1) if match else url
+
+
+# Friendly display names for known sites, keyed the same way as
+# SITE_OVERRIDES (a substring matched against the URL's host). Sites with
+# no entry here just fall back to their bare domain label (e.g. "example").
+SITE_DISPLAY_NAMES: dict[str, str] = {
+    "chaturbate.com": "Chaturbate",
+    "camsoda.com": "Camsoda",
+    "bongacams.com": "BongaCams",
+}
+
+
+def extract_site(url: str) -> str:
+    """Return a short, human-readable site name from a stream URL, e.g.
+    "https://chaturbate.com/someuser/" -> "Chaturbate". Falls back to the
+    bare registrable domain label (e.g. "example" for example.com/tv) for
+    sites with no entry in SITE_DISPLAY_NAMES."""
+    host = (url or "").lower()
+    for site_key, display_name in SITE_DISPLAY_NAMES.items():
+        if site_key in host:
+            return display_name
+
+    match = re.search(r'(?:https?://)?(?:www\.)?([^/]+)', url)
+    domain = match.group(1) if match else ""
+    label = domain.split(".")[0] if domain else ""
+    return label.capitalize() if label else "Unknown"
 
 
 def log_exception(prefix: str) -> None:
@@ -368,6 +593,7 @@ class SharedPreviewWorker(QThread):
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
             cmd.extend(get_cookie_args())
+            cmd.extend(get_site_check_args(page_url))
             cmd.append(page_url)
             r = subprocess.run(
                 cmd,
@@ -392,11 +618,7 @@ class SharedPreviewWorker(QThread):
         if not stream_url:
             return
 
-        host = page_url.lower()
-        if "chaturbate" in host:
-            referer = "https://chaturbate.com/"
-        else:
-            referer = ""
+        referer = get_site_referer(page_url)
 
         W, H = 320, 180
         user_agent = get_user_agent() or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -404,10 +626,14 @@ class SharedPreviewWorker(QThread):
             FFMPEG_PATH,
             "-user_agent", user_agent,
             *([ "-headers", f"Referer: {referer}\r\n"] if referer else []),
+            *get_site_ffmpeg_args(page_url),
             "-timeout", "10000000",
             "-i", stream_url,
             "-frames:v", "1",
-            "-vf", f"scale={W}:{H}",
+            "-vf", (
+                f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2"
+            ),
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "pipe:1",
             "-loglevel", "error", "-nostats",
@@ -494,7 +720,7 @@ class DownloadWorker(QThread):
     log_signal                = Signal(str, str)   # (username, message)
     finished_signal           = Signal(str)        # url
     progress_signal           = Signal(str, int)   # (username, percent)
-    resolution_signal         = Signal(str, str)   # (url, "1920x1080")
+    resolution_signal         = Signal(str, str, int)  # (url, "1920x1080", fps)
     auto_download_disabled_signal = Signal(str)      # url
     short_download_signal     = Signal(str, int)   # (url, elapsed_seconds) — emitted when a download ends early
 
@@ -509,6 +735,15 @@ class DownloadWorker(QThread):
         "[in#",           # ffmpeg demuxer keepalive noise, e.g. "[in#0/hls @ ...]"
     )
 
+    # Matches ffmpeg's stream description line, e.g.:
+    #   Stream #0:0[0x0]: Video: h264 ..., 1280x720, 60 fps, 30 tbr, 90k tbn, ...
+    # This is the ground truth for the format actually being downloaded --
+    # some sites only expose a single format (e.g. 720p60), so this can
+    # reveal a higher fps than the pre-download probe assumed.
+    _STREAM_FORMAT_RE = re.compile(
+        r"Video:.*?(\d+)x(\d+)[^,]*,\s*([\d.]+)\s*fps", re.IGNORECASE
+    )
+
     def __init__(self, stream_url: str, username: str, output_path: str = "Downloads"):
         super().__init__()
         self.setObjectName(f"DownloadWorker-{username}")
@@ -520,21 +755,27 @@ class DownloadWorker(QThread):
         self._rate_limiter = RateLimiter(2.0)
         self._line_queue: Queue = Queue()
         self._started_at = 0.0
+        self._last_detected_format: Optional[tuple[str, int]] = None
         os.makedirs(self.output_path, exist_ok=True)
 
-    def _probe_resolution(self) -> str:
-        """Ask yt-dlp for the selected format's resolution before starting the download."""
+    def _probe_resolution(self) -> tuple[str, int]:
+        """Ask yt-dlp for the selected format's resolution + fps before
+        starting the download. This is a best-effort guess from metadata
+        -- for sites that only expose one format, the live stream output
+        parsed in run() is the more reliable source and will correct
+        this once the download actually opens the stream."""
         try:
             cmd = [
                 YTDLP_PATH,
                 "--no-playlist",
                 "--format", get_download_format_selector(),
-                "--print", "%(width)sx%(height)s",
+                "--print", "%(width)sx%(height)s@%(fps)s",
             ]
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
             cmd.extend(get_cookie_args())
+            cmd.extend(get_site_args(self.stream_url))
             cmd.append(self.stream_url)
             r = subprocess.run(
                 cmd,
@@ -544,15 +785,21 @@ class DownloadWorker(QThread):
                 **_subprocess_kwargs(),
             )
             if r.returncode == 0:
-                res = r.stdout.strip().split("\n")[0]
-                if re.match(r"^\d+x\d+$", res):
-                    return res
+                line = r.stdout.strip().split("\n")[0]
+                m = re.match(r"^(\d+x\d+)@(.+)$", line)
+                if m:
+                    res = m.group(1)
+                    try:
+                        fps = int(round(float(m.group(2))))
+                    except ValueError:
+                        fps = MAX_DOWNLOAD_FPS  # yt-dlp printed "NA" or similar -- fall back to the configured cap
+                    return res, fps
             if r.returncode != 0:
                 err = format_error_message(r.stderr, r.stdout)
                 print(f"[Debug] DownloadWorker probe failed for {self.username}: {err}")
         except Exception:
             pass
-        return ""
+        return "", 0
 
     def _drain_stdout(self, proc: subprocess.Popen):
         """Runs in a tiny daemon thread — reads stdout and queues lines."""
@@ -569,13 +816,15 @@ class DownloadWorker(QThread):
             return
         try:
             self.log_signal.emit(self.username, "🔍 Probing resolution…")
-            res = self._probe_resolution()
+            res, fps = self._probe_resolution()
             if res:
-                self.log_signal.emit(self.username, f"📐 Resolution: {res}")
-                self.resolution_signal.emit(self.stream_url, res)
+                self.log_signal.emit(self.username, f"📐 Resolution: {res} ({fps or '?'} fps, probed)")
+                self.resolution_signal.emit(self.stream_url, res, fps or MAX_DOWNLOAD_FPS)
+                self._last_detected_format = (res, fps or MAX_DOWNLOAD_FPS)
             else:
                 self.log_signal.emit(self.username, "📐 Resolution unknown")
-                self.resolution_signal.emit(self.stream_url, "")
+                self.resolution_signal.emit(self.stream_url, "", MAX_DOWNLOAD_FPS)
+                self._last_detected_format = None
 
             self._started_at = time.time()
 
@@ -598,6 +847,7 @@ class DownloadWorker(QThread):
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
             cmd.extend(get_cookie_args())
+            cmd.extend(get_site_args(self.stream_url))
             cmd.append(self.stream_url)
             self._rate_limiter.wait_if_needed()
 
@@ -637,6 +887,24 @@ class DownloadWorker(QThread):
                     continue
                 if any(s in line.lower() for s in ("downloading webpage", "extracting", "download best")):
                     continue
+
+                fmt_match = self._STREAM_FORMAT_RE.search(line)
+                if fmt_match:
+                    actual_res = f"{fmt_match.group(1)}x{fmt_match.group(2)}"
+                    try:
+                        actual_fps = int(round(float(fmt_match.group(3))))
+                    except ValueError:
+                        actual_fps = 0
+                    detected = (actual_res, actual_fps or MAX_DOWNLOAD_FPS)
+                    if detected != self._last_detected_format:
+                        self._last_detected_format = detected
+                        self.log_signal.emit(
+                            self.username,
+                            f"📐 Actual stream format: {detected[0]} ({detected[1]} fps)"
+                        )
+                        self.resolution_signal.emit(self.stream_url, detected[0], detected[1])
+                    continue
+
                 if "[download]" in line.lower():
                     if "completed" in line.lower():
                         self.log_signal.emit(self.username, "✓ Download completed")
@@ -798,6 +1066,7 @@ class StreamChecker(QThread):
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
             cmd.extend(get_cookie_args())
+            cmd.extend(get_site_check_args(url))
             cmd.append(url)
             r = subprocess.run(
                 cmd,
@@ -810,18 +1079,27 @@ class StreamChecker(QThread):
             stderr = r.stderr.lower()
 
             if r.returncode != 0:
-                if "currently away" in stderr:
+                stderr_lower = stderr.lower()
+                url_lower = url.lower()
+
+                if "currently away" in stderr_lower:
                     return StreamStatus.AWAY, "🌙 Away"
-                if "hidden session" in stderr:
+
+                if "hidden session" in stderr_lower:
                     return StreamStatus.PRIVATE, "🔒 Hidden session (private)"
-                if "private" in stderr:
+
+                if "private" in stderr_lower:
                     return StreamStatus.PRIVATE, "🔒 Private show"
-                if "age restricted" in stderr or "age-restricted" in stderr:
+
+                if "age restricted" in stderr_lower or "age-restricted" in stderr_lower:
                     return StreamStatus.PRIVATE, "🔒 Age restricted"
-                if "offline" in stderr:
+
+                if "offline" in stderr_lower:
                     return StreamStatus.OFFLINE, "💤 Offline"
-                if "video unavailable" in stderr or "not found" in stderr:
+
+                if "video unavailable" in stderr_lower or "not found" in stderr_lower:
                     return StreamStatus.OFFLINE, "💤 Stream not found"
+
                 error_hint = format_error_message(stderr, stdout)
                 print(f"[Debug] yt-dlp error for {url}: {error_hint}")
                 return StreamStatus.ERROR, error_hint
@@ -1609,7 +1887,7 @@ class StreamDownloaderGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("Stream Download Manager")
         self.setGeometry(100, 100, 920, 780)
-        self.setMinimumSize(920, 600)
+        self.setMinimumSize(1020, 600)
 
         # Workers
         self.preview_worker = SharedPreviewWorker()
@@ -1861,31 +2139,38 @@ class StreamDownloaderGUI(QMainWindow):
 
         # Table
         self._table = QTableWidget()
-        self._table.setColumnCount(10)
+        self._table.setColumnCount(12)  # Was 11
         self._table.setHorizontalHeaderLabels([
-            "Preview", "Username", "Status", "Duration",
-            "Res", "Auto", "DL", "Start", "Stop", "✕",
+            "Preview", "Site", "Username", "Status", "Duration",
+            "Res", "FPS", "Auto", "DL", "Start", "Stop", "✕",
         ])
+        # After setting the header labels, update the column settings:
+
         hh = self._table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Fixed)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
-        hh.setSectionResizeMode(2, QHeaderView.Fixed)
-        hh.setSectionResizeMode(3, QHeaderView.Fixed)
-        hh.setSectionResizeMode(4, QHeaderView.Fixed)
-        hh.setSectionResizeMode(5, QHeaderView.Fixed)
-        hh.setSectionResizeMode(6, QHeaderView.Fixed)
-        hh.setSectionResizeMode(7, QHeaderView.Fixed)
-        hh.setSectionResizeMode(8, QHeaderView.Fixed)
-        hh.setSectionResizeMode(9, QHeaderView.Fixed)
-        self._table.setColumnWidth(0, 112)
-        self._table.setColumnWidth(2, 90)
-        self._table.setColumnWidth(3, 90)
-        self._table.setColumnWidth(4, 80)
-        self._table.setColumnWidth(5, 48)
-        self._table.setColumnWidth(6, 36)
-        self._table.setColumnWidth(7, 85)
-        self._table.setColumnWidth(8, 85)
-        self._table.setColumnWidth(9, 90)
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)   # Preview
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)   # Site  <-- NEW
+        hh.setSectionResizeMode(2, QHeaderView.Stretch) # Username
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)   # Status
+        hh.setSectionResizeMode(4, QHeaderView.Fixed)   # Duration
+        hh.setSectionResizeMode(5, QHeaderView.Fixed)   # Res
+        hh.setSectionResizeMode(6, QHeaderView.Fixed)   # FPS  <-- NEW
+        hh.setSectionResizeMode(7, QHeaderView.Fixed)   # Auto
+        hh.setSectionResizeMode(8, QHeaderView.Fixed)   # DL
+        hh.setSectionResizeMode(9, QHeaderView.Fixed)   # Start
+        hh.setSectionResizeMode(10, QHeaderView.Fixed)  # Stop
+        hh.setSectionResizeMode(11, QHeaderView.Fixed)  # ✕
+
+        self._table.setColumnWidth(0, 112)   # Preview
+        self._table.setColumnWidth(1, 90)    # Site  <-- NEW
+        self._table.setColumnWidth(3, 90)    # Status
+        self._table.setColumnWidth(4, 90)    # Duration
+        self._table.setColumnWidth(5, 80)    # Res
+        self._table.setColumnWidth(6, 48)    # FPS  <-- NEW
+        self._table.setColumnWidth(7, 48)    # Auto
+        self._table.setColumnWidth(8, 36)    # DL
+        self._table.setColumnWidth(9, 85)    # Start
+        self._table.setColumnWidth(10, 85)   # Stop
+        self._table.setColumnWidth(11, 90)   # ✕
         self._table.verticalHeader().setDefaultSectionSize(64)
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1964,30 +2249,43 @@ class StreamDownloaderGUI(QMainWindow):
         )
         self._table.setCellWidget(row, 0, thumb)
 
-        # Col 1 — username
+        # Col 1 — site  <-- NEW
+        site_lbl = QLabel(extract_site(url))
+        site_lbl.setAlignment(Qt.AlignCenter)
+        site_lbl.setToolTip(url)
+        site_lbl.setStyleSheet("font-size:11px; color:#8a8aa8;")
+        self._table.setCellWidget(row, 1, site_lbl)
+
+        # Col 2 — username
         u_item = QTableWidgetItem(username)
         u_item.setToolTip(url)
         u_item.setForeground(QColor("#d0d0e8"))
-        self._table.setItem(row, 1, u_item)
+        self._table.setItem(row, 2, u_item)
 
-        # Col 2 — status
+        # Col 3 — status
         status_lbl = QLabel("⏳ Checking")
         status_lbl.setAlignment(Qt.AlignCenter)
         status_lbl.setStyleSheet("font-size:11px; color:#666;")
-        self._table.setCellWidget(row, 2, status_lbl)
+        self._table.setCellWidget(row, 3, status_lbl)
 
-        # Col 3 — duration
+        # Col 4 — duration
         dur = DownloadTimer()
-        self._table.setCellWidget(row, 3, dur)
+        self._table.setCellWidget(row, 4, dur)
         self.download_timers[url] = dur
 
-        # Col 4 — resolution
+            # Col 5 — resolution
         res_lbl = QLabel("—")
         res_lbl.setAlignment(Qt.AlignCenter)
         res_lbl.setStyleSheet("font-size:11px; color:#555; font-family:'Courier New',monospace;")
-        self._table.setCellWidget(row, 4, res_lbl)
+        self._table.setCellWidget(row, 5, res_lbl)
 
-        # Col 5 — auto-start
+        # Col 6 — FPS  <-- NEW
+        fps_lbl = QLabel("—")
+        fps_lbl.setAlignment(Qt.AlignCenter)
+        fps_lbl.setStyleSheet("font-size:11px; color:#555; font-family:'Courier New',monospace;")
+        self._table.setCellWidget(row, 6, fps_lbl)
+
+        # Col 7 — auto-start
         auto_cb = QCheckBox()
         auto_cb.setChecked(auto_start)
         auto_cb.setToolTip("Automatically start downloading when this stream goes live")
@@ -1998,35 +2296,35 @@ class StreamDownloaderGUI(QMainWindow):
         cb_lay.addWidget(auto_cb)
         cb_lay.setAlignment(Qt.AlignCenter)
         cb_lay.setContentsMargins(0, 0, 0, 0)
-        self._table.setCellWidget(row, 5, cb_wrap)
+        self._table.setCellWidget(row, 7, cb_wrap)
 
-        # Col 6 — DL indicator
+        # Col 8 — DL indicator
         dl_lbl = QLabel("—")
         dl_lbl.setAlignment(Qt.AlignCenter)
         dl_lbl.setStyleSheet("color:#444; font-size:14px;")
-        self._table.setCellWidget(row, 6, dl_lbl)
+        self._table.setCellWidget(row, 8, dl_lbl)
 
-        # Col 7 — Start
+        # Col 9 — Start
         start_btn = QPushButton("▶ Start")
         start_btn.setObjectName("startBtn")
         start_btn.setToolTip("Manually start downloading this stream now")
         start_btn.clicked.connect(lambda _, u=url: self._manual_start(u))
-        self._table.setCellWidget(row, 7, start_btn)
+        self._table.setCellWidget(row, 9, start_btn)
 
-        # Col 8 — Stop
+        # Col 10 — Stop
         stop_btn = QPushButton("⏹ Stop")
         stop_btn.setObjectName("stopBtn")
         stop_btn.setEnabled(False)
         stop_btn.setToolTip("Stop the current download for this stream")
         stop_btn.clicked.connect(lambda _, u=url: self._stop_download(u))
-        self._table.setCellWidget(row, 8, stop_btn)
+        self._table.setCellWidget(row, 10, stop_btn)
 
-        # Col 9 — Remove
+        # Col 11 — Remove
         rm_btn = QPushButton("Remove")
         rm_btn.setObjectName("removeBtn")
         rm_btn.setToolTip("Remove this stream from the list")
         rm_btn.clicked.connect(lambda _, u=url: self._remove_stream(u))
-        self._table.setCellWidget(row, 9, rm_btn)
+        self._table.setCellWidget(row, 11, rm_btn)
 
         self.checker.add_stream(url, force=True)
         self._log_msg(f"➕ Added {username}", "#4CAF50")
@@ -2179,7 +2477,7 @@ class StreamDownloaderGUI(QMainWindow):
 
         # Update status cell
         text, fg, bg = STATUS_STYLE.get(status, ("?", "#888", "#1a1a1a"))
-        lbl = self._table.cellWidget(item.row, 2)
+        lbl = self._table.cellWidget(item.row, 3)
         if lbl:
             lbl.setText(text)
             lbl.setStyleSheet(
@@ -2209,12 +2507,15 @@ class StreamDownloaderGUI(QMainWindow):
             self._log_msg(f"🛑 Force stop: {item.username} ({status.value})", "#F44336")
             self._stop_download(url)
 
-    def _on_resolution(self, url: str, res: str):
+    def _on_resolution(self, url: str, res: str, fps: int):
         item = self.stream_items.get(url)
         if not item:
             return
         item.resolution = res
-        res_lbl = self._table.cellWidget(item.row, 4)
+        item.fps = fps or 30
+
+        # Set the Res column (col 5)
+        res_lbl = self._table.cellWidget(item.row, 5)
         if res_lbl:
             if res:
                 res_lbl.setText(res)
@@ -2226,6 +2527,21 @@ class StreamDownloaderGUI(QMainWindow):
                 res_lbl.setStyleSheet(
                     "font-size:11px; color:#555; font-family:'Courier New',monospace;"
                 )
+
+        # Set the FPS column (col 6) - NEW
+        fps_lbl = self._table.cellWidget(item.row, 6)
+        if fps_lbl:
+            if fps and fps > 0:
+                fps_lbl.setText(f"{fps}")
+                fps_lbl.setStyleSheet(
+                    "font-size:11px; color:#9df; font-family:'Courier New',monospace;"
+                )
+            else:
+                fps_lbl.setText("—")
+                fps_lbl.setStyleSheet(
+                    "font-size:11px; color:#555; font-family:'Courier New',monospace;"
+                )
+
         self._update_download_info()
 
     def _on_dl_log(self, username: str, message: str):
@@ -2355,7 +2671,7 @@ class StreamDownloaderGUI(QMainWindow):
         details: list[str] = []
         for item in active_items:
             resolution = item.resolution or ""
-            kbps = DOWNLOAD_BITRATE_KBPS.get(resolution, 0)
+            kbps = get_bitrate_kbps(resolution, item.fps)
             if kbps <= 0:
                 details.append(f"{item.username}: unknown")
                 continue
@@ -2366,7 +2682,8 @@ class StreamDownloaderGUI(QMainWindow):
                 size_label = f"{size_per_hour_mb / 1024:.2f} GB/h"
             else:
                 size_label = f"{size_per_hour_mb:.2f} MB/h"
-            details.append(f"{item.username}: {resolution} → {size_label}")
+            fps_note = f" @{item.fps}fps" if item.fps and item.fps > 30 else ""
+            details.append(f"{item.username}: {resolution}{fps_note} → {size_label}")
 
         total_per_hour_mb = total_mbps * 3600 / 8.0
         if total_per_hour_mb >= 1024:
@@ -2394,26 +2711,33 @@ class StreamDownloaderGUI(QMainWindow):
             return
         row = item.row
 
-        dl_lbl = self._table.cellWidget(row, 6)
+        dl_lbl = self._table.cellWidget(row, 8)  # Was col 7, now col 8
         if dl_lbl:
             dl_lbl.setText("●" if active else "—")
             dl_lbl.setStyleSheet(
                 f"color:{'#4fc' if active else '#444'}; font-size:{'16' if active else '14'}px;"
             )
 
-        for col, enabled in ((7, not active), (8, active)):
+        for col, enabled in ((9, not active), (10, active)):  # Start/Stop columns shifted
             btn = self._table.cellWidget(row, col)
             if btn:
                 btn.setEnabled(enabled)
 
         if not active:
-            res_lbl = self._table.cellWidget(row, 4)
+            res_lbl = self._table.cellWidget(row, 5)
             if res_lbl:
                 res_lbl.setText("—")
                 res_lbl.setStyleSheet(
                     "font-size:11px; color:#555; font-family:'Courier New',monospace;"
                 )
+            fps_lbl = self._table.cellWidget(row, 6)  # FPS column
+            if fps_lbl:
+                fps_lbl.setText("—")
+                fps_lbl.setStyleSheet(
+                    "font-size:11px; color:#555; font-family:'Courier New',monospace;"
+                )
             item.resolution = ""
+            item.fps = 30
 
     def _check_processes(self):
         """Cross-platform process health check."""
