@@ -110,17 +110,7 @@ Once that's done (whichever way you set it up), just double-click `stream_manage
 
 Most day-to-day settings — download output folder, cookies, User-Agent, video quality, and the auto-restart short-download protection — are configured from inside the app now: click **⚙ Settings** after launching (see [Settings](#️-settings) below). They persist automatically once set; you don't need to edit the script at all for normal use.
 
-One setting is still code-only, at the top of `stream_manager.py`, since it's one-time tuning rather than something you'd change per session. `DOWNLOAD_BITRATE_KBPS` maps each resolution to an expected bitrate in kbps, used to power the **"Download info"** estimate at the bottom of the main window — it shows roughly how much data each active recording is using per hour, and a combined total across everything currently downloading. It's just an estimate, not a real measurement or a limit of any kind, so most people never need to touch it — the only reason to edit it is if you want more accurate MB/h-per-resolution numbers for your own typical streams than the defaults below give you:
-
-```python
-DOWNLOAD_BITRATE_KBPS = {
-    "640x360": 896,
-    "960x540": 1696,
-    "1280x720": 3096,
-    "1920x1080": 5128,
-    "3840x2160": 7192,
-}
-```
+Download info estimates — The bandwidth and storage estimates shown at the bottom of the main window are based on typical bitrates for each resolution and frame rate. For resolutions not in the predefined list, the app estimates from the nearest matching resolution. These are rough estimates only, not a real measurement or a limit of any kind. Most users never need to touch this; if you want to adjust the default values, you can edit DOWNLOAD_BITRATE_KBPS near the top of stream_manager.py.
 
 ---
 
