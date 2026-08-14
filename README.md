@@ -1,6 +1,7 @@
 # Stream Monitor
 
-A desktop GUI for monitoring and auto-recording live Chaturbate streams on Windows, macOS, and Linux — tracks multiple models in parallel, shows live thumbnail previews, and downloads automatically via `yt-dlp` and `ffmpeg` the moment someone goes live.
+A desktop GUI for monitoring and auto-recording live streams from **Chaturbate, Camsoda, and BongaCams** on Windows, macOS, and Linux — tracks multiple models in parallel, shows live thumbnail previews, and downloads automatically via `yt-dlp` and `ffmpeg` when someone goes live.
+
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -15,6 +16,7 @@ A desktop GUI for monitoring and auto-recording live Chaturbate streams on Windo
 ## ✨ Features
 
 - Live stream status checking via `yt-dlp`, with adaptive polling — checks every 90s while a stream is live, backs off up to 300s for streams that stay offline, so idle rooms don't get hammered
+- Multi-site support for Chaturbate, Camsoda, and BongaCams, with per-site `yt-dlp` overrides where required
 - Real-time thumbnail previews, captured via a single-frame `ffmpeg` grab per stream
 - Automatic recording via `yt-dlp` the moment a tracked stream goes live, with a 5-level format-selector fallback (exact resolution+FPS down to just "best available")
 - Settings dialog for download output, cookies (read live from a real browser's cookie database), User-Agent, and video quality — every field persists across restarts
@@ -26,10 +28,14 @@ A desktop GUI for monitoring and auto-recording live Chaturbate streams on Windo
 ## 📸 Preview
 
 The application showing multiple stream states:
-<img width="916" height="801" alt="Stream-Monitor" src="https://github.com/user-attachments/assets/dd0c3d51-e145-401c-bd22-31b4ed4784e8" />
+<img width="1022" height="816" alt="1" src="https://github.com/user-attachments/assets/5b309edf-2128-4e23-888b-7a78e6ec0a5c" />
+
+
 
 Stream-monitor settings:
-<img width="915" height="804" alt="Settings_dialog" src="https://github.com/user-attachments/assets/d3c173d4-b724-4919-a229-6ba271b449ce" />
+<img width="1023" height="814" alt="2" src="https://github.com/user-attachments/assets/fa0b86ba-4219-475d-983b-e1bb3990605b" />
+
+
 
 
 
