@@ -1082,6 +1082,10 @@ class StreamChecker(QThread):
                 stderr_lower = stderr.lower()
                 url_lower = url.lower()
 
+                # Camsoda: offline/no active stream
+                if "camsoda" in url_lower and "no active streams found" in stderr_lower:
+                    return StreamStatus.OFFLINE, "💤 Offline"
+
                 if "currently away" in stderr_lower:
                     return StreamStatus.AWAY, "🌙 Away"
 
