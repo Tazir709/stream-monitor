@@ -116,11 +116,9 @@ Download info estimates — The bandwidth and storage estimates shown at the bot
 
 ## 🚀 Usage
 
-Run the application:
+### Run the application:
 
-### Run the application
-
-- **Windows:** double-click `stream_manager.py`
+- **Windows**: double-click stream_manager.py, or run `python stream_manager.py` from a Command Prompt/PowerShell window
 - **macOS/Linux:** `./stream_manager.py`
 
 No venv activation or interpreter path needed either way — it relaunches itself automatically.
@@ -158,12 +156,12 @@ Picking `Firefox-based` reveals a second dropdown: `Firefox`, `Floorp`, `Zen`, `
 
 ## 🍪 Exporting cookies
 
-Only relevant if the **Cookies file** fallback above ever comes up (Chromium browsers on Windows) — most users never need this.
+Only relevant if the Cookies file fallback above ever comes up (primarily Chromium browsers on Windows) — most users never need this.
 
-1. Install [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) in the browser you're logged into Chaturbate with.
-2. Log into chaturbate.com normally in that browser.
-3. Click the extension's icon, export cookies (either just for chaturbate.com or all sites both work), and save the resulting `.txt` file somewhere you'll remember.
-4. In Stream Monitor's Settings, with that Chromium browser selected, click the **Cookies file** row's button and pick the file you just saved.
+1. Install [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) in the browser you're logged into the relevant supported site with.
+2. Log into the site normally in that browser.
+3. Click the extension's icon, export cookies (either just for the relevant site or all sites — both work), and save the resulting .txt file somewhere you'll remember.
+4. In Stream Monitor's Settings, with that Chromium browser selected, click the Cookies file row's button and pick the file you just saved.
 
 ---
 
@@ -186,7 +184,7 @@ Downloads/
 
 **`ffmpeg` errors with "No such file or directory" even though `yt-dlp` works fine** — `ffmpeg` can't be `pip install`ed (there's no package for the actual binary), so it always needs a real system-level install and to be on PATH — see Step 2 above. This is different from `yt-dlp`, which the app can find inside its own venv automatically even without activating it.
 
-**A stream shows offline when you know it's live, or downloads fail immediately** — almost always missing cookies. Open Settings and confirm Cookie source is pointed at a browser you're actually logged into Chaturbate with.
+**A stream shows offline when you know it's live, or downloads fail immediately** — almost always missing cookies. Open Settings and confirm Cookie source is pointed at a browser you're actually logged into the relevant supported site with.
 
 **Still blocked even with valid cookies and a matching User-Agent** — two things worth checking: make sure `curl_cffi` is installed in a supported version (`0.5.10` or `0.10.x`–`0.15.x`, see Requirements above) so yt-dlp can impersonate a real browser's TLS fingerprint; and double-check your User-Agent actually matches the browser your cookies came from, not just "some" browser.
 
