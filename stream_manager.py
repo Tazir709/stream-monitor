@@ -49,18 +49,18 @@ from enum import Enum
 from typing import Optional, Dict
 from datetime import datetime
 from queue import Queue, Empty
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import traceback
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QLabel, QPushButton, QLineEdit,
     QTextEdit, QCheckBox, QStatusBar, QMessageBox, QHeaderView,
-    QSplitter, QFrame, QSizePolicy, QDialog, QFileDialog, QComboBox,
+    QSplitter, QDialog, QFileDialog, QComboBox,
     QFormLayout, QDialogButtonBox, QSpinBox
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize, QDir, QUrl
-from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QDesktopServices
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QDir, QUrl
+from PySide6.QtGui import QImage, QPixmap, QColor, QDesktopServices
 
 
 # ─────────────────────────────────────────────
@@ -199,6 +199,8 @@ def get_cookie_args() -> list[str]:
     """--cookies <file> if a Chromium-browser cookies.txt fallback is
     configured and still exists, else the normal --cookies-from-browser."""
     real_browser = BROWSER.split(":", 1)[0]
+    if not real_browser:
+        return []
     if COOKIES_FILE and real_browser in _CHROMIUM_BROWSERS and os.path.isfile(COOKIES_FILE):
         return ["--cookies", COOKIES_FILE]
     return ["--cookies-from-browser", BROWSER]
@@ -283,6 +285,16 @@ def _site_override(url: str) -> dict:
         if site_key in host:
             return cfg
     return {}
+
+
+BROWSER_REQUIRED_MSG = "No browser configured in Settings — required for this site's cookies/impersonate"
+
+
+def _missing_browser_for_site(url: str) -> bool:
+    # Only True forced-impersonate (reuse whatever's configured in Settings)
+    # actually needs BROWSER set -- a specific string like "chrome" forces
+    # that target regardless of BROWSER, per the SITE_OVERRIDES docstring.
+    return _site_override(url).get("impersonate") is True and not BROWSER
 
 
 def _impersonate_args(cfg: dict) -> list[str]:
@@ -453,6 +465,8 @@ CHROMIUM_COOKIE_ERROR_MSG = "🔒 Chrome cookie access failed — see Troublesho
 def format_error_message(stderr: str, stdout: str = "") -> str:
     text = f"{stderr}\n{stdout}".lower()
 
+    if "no browser configured" in text:
+        return f"⚠ {BROWSER_REQUIRED_MSG}"
     if "could not copy chrome cookie database" in text or "failed to decrypt with dpapi" in text:
         return CHROMIUM_COOKIE_ERROR_MSG
     if "403" in text or "forbidden" in text or "access denied" in text:
@@ -508,7 +522,7 @@ class CookieProbeWorker(QThread):
             if "could not copy chrome cookie database" in text or "failed to decrypt with dpapi" in text:
                 accessible = False
         except Exception:
-            pass
+            log_exception(f"CookieProbeWorker failed for {self.real_browser}")
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -571,8 +585,8 @@ class SharedPreviewWorker(QThread):
             for p in self._ffmpeg_processes:
                 try:
                     p.kill(); p.wait(timeout=2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[Debug] SharedPreviewWorker.stop: ffmpeg process already gone or failed to kill: {e!r}")
             self._ffmpeg_processes.clear()
         if not self.wait(6000):
             print("[Debug] SharedPreviewWorker did not stop in time, terminating")
@@ -587,6 +601,9 @@ class SharedPreviewWorker(QThread):
             stream_url, expiry = cached
             if time.time() < expiry:
                 return stream_url
+        if _missing_browser_for_site(page_url):
+            print(f"[Debug] PreviewWorker _get_stream_url skipped for {page_url}: {BROWSER_REQUIRED_MSG}")
+            return None
         try:
             cmd = [YTDLP_PATH, "--get-url", "--no-playlist"]
             user_agent = get_user_agent()
@@ -790,15 +807,15 @@ class DownloadWorker(QThread):
                 if m:
                     res = m.group(1)
                     try:
-                        fps = int(round(float(m.group(2))))
+                        fps = round(float(m.group(2)))
                     except ValueError:
                         fps = MAX_DOWNLOAD_FPS  # yt-dlp printed "NA" or similar -- fall back to the configured cap
                     return res, fps
             if r.returncode != 0:
                 err = format_error_message(r.stderr, r.stdout)
                 print(f"[Debug] DownloadWorker probe failed for {self.username}: {err}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Debug] DownloadWorker probe failed for {self.username}: {e!r}")
         return "", 0
 
     def _drain_stdout(self, proc: subprocess.Popen):
@@ -815,6 +832,8 @@ class DownloadWorker(QThread):
         if self.is_running:
             return
         try:
+            if _missing_browser_for_site(self.stream_url):
+                raise RuntimeError(BROWSER_REQUIRED_MSG)
             self.log_signal.emit(self.username, "🔍 Probing resolution…")
             res, fps = self._probe_resolution()
             if res:
@@ -851,13 +870,13 @@ class DownloadWorker(QThread):
             cmd.append(self.stream_url)
             self._rate_limiter.wait_if_needed()
 
-            kwargs: dict = dict(
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
+            kwargs: dict = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "bufsize": 1,
+                "universal_newlines": True,
+            }
             if os.name == "nt":
                 kwargs["creationflags"] = (
                     subprocess.CREATE_NEW_PROCESS_GROUP |
@@ -892,7 +911,7 @@ class DownloadWorker(QThread):
                 if fmt_match:
                     actual_res = f"{fmt_match.group(1)}x{fmt_match.group(2)}"
                     try:
-                        actual_fps = int(round(float(fmt_match.group(3))))
+                        actual_fps = round(float(fmt_match.group(3)))
                     except ValueError:
                         actual_fps = 0
                     detected = (actual_res, actual_fps or MAX_DOWNLOAD_FPS)
@@ -912,10 +931,11 @@ class DownloadWorker(QThread):
                         m = re.search(r"(\d+\.?\d*)%", line)
                         if m:
                             self.progress_signal.emit(self.username, int(float(m.group(1))))
-                elif any(k in line.lower() for k in ("error", "warning", "finished")):
-                    if not any(n in line.lower() for n in self._NOISY_PATTERNS):
-                        message = line[:120]
-                        self.log_signal.emit(self.username, message)
+                elif any(k in line.lower() for k in ("error", "warning", "finished")) and not any(
+                    n in line.lower() for n in self._NOISY_PATTERNS
+                ):
+                    message = line[:120]
+                    self.log_signal.emit(self.username, message)
 
             try:
                 self.process.wait(timeout=10)
@@ -961,7 +981,7 @@ class DownloadWorker(QThread):
 
             parent.terminate()
 
-            gone, alive = psutil.wait_procs(
+            _gone, alive = psutil.wait_procs(
                 children + [parent],
                 timeout=5
             )
@@ -1060,6 +1080,8 @@ class StreamChecker(QThread):
 
     def _check(self, url: str) -> tuple[StreamStatus, str]:
         self._rate_limiter.wait_if_needed()
+        if _missing_browser_for_site(url):
+            return StreamStatus.ERROR, f"⚠ {BROWSER_REQUIRED_MSG}"
         try:
             cmd = [self._ytdlp, "--simulate", "--print", "%(live_status)s"]
             user_agent = get_user_agent()
@@ -1345,7 +1367,7 @@ _FIREFOX_FORK_BASE_DIRS = {
         "darwin": lambda: [os.path.expanduser("~/Library/Application Support/librewolf")],
     },
 }
-_BROWSER_TOP_CHOICES = ["Firefox-based"] + [_BROWSER_DISPLAY_NAMES[c] for c in _BROWSER_CHOICES if c != "firefox"]
+_BROWSER_TOP_CHOICES = ["Pick a browser", "Firefox-based"] + [_BROWSER_DISPLAY_NAMES[c] for c in _BROWSER_CHOICES if c != "firefox"]
 _FIREFOX_VARIANT_CHOICES = ["Firefox"] + list(_FIREFOX_FORK_BASE_DIRS) + ["Other (browse manually)"]
 
 
@@ -1838,6 +1860,17 @@ class SettingsDialog(QDialog):
         global BROWSER, BROWSER_DISPLAY, COOKIES_FILE
         COOKIES_FILE = self._cookies_file
         top = self.browser_combo.currentText()
+
+        if top == "Pick a browser":
+            self.firefox_variant_combo.setVisible(False)
+            self.fork_detect_warning.setVisible(False)
+            self._cookie_path_btn.setVisible(False)
+            self._set_cookies_file_row_visible(False)
+            BROWSER_DISPLAY = ""
+            BROWSER = ""
+            self.settings_changed.emit()
+            return
+
         is_firefox_based = (top == "Firefox-based")
         self.firefox_variant_combo.setVisible(is_firefox_based)
 
@@ -1925,6 +1958,7 @@ class StreamDownloaderGUI(QMainWindow):
 
         self._settings_dialog = SettingsDialog(self)
         self._settings_dialog.settings_changed.connect(self._save)
+        self._settings_dialog.settings_changed.connect(self._update_browser_unset_banner)
         self._settings_dialog.cookie_access_confirmed_broken.connect(self._maybe_show_chromium_cookie_dialog)
 
         # Convenience references so the rest of the class can keep reading
@@ -1936,6 +1970,7 @@ class StreamDownloaderGUI(QMainWindow):
         self._build_ui()
         self.setStyleSheet(DARK)
         self._load_saved_streams()
+        self._update_browser_unset_banner()
 
         QApplication.instance().aboutToQuit.connect(self._shutdown_workers)
 
@@ -2032,23 +2067,22 @@ class StreamDownloaderGUI(QMainWindow):
         saved_browser_display = str(settings.get("browser_display", "") or "").strip()
         if saved_browser:
             browser, _, path = saved_browser.partition(":")
-            if browser in _BROWSER_CHOICES:
-                if not path or os.path.isdir(path):
-                    global BROWSER, BROWSER_DISPLAY
-                    BROWSER = saved_browser
-                    BROWSER_DISPLAY = saved_browser_display if saved_browser_display in _FIREFOX_FORK_BASE_DIRS else ""
-                    if browser == "firefox":
-                        self._settings_dialog.browser_combo.setCurrentText("Firefox-based")
-                        if BROWSER_DISPLAY:
-                            self._settings_dialog.firefox_variant_combo.setCurrentText(BROWSER_DISPLAY)
-                        elif path:
-                            self._settings_dialog.firefox_variant_combo.setCurrentText("Other (browse manually)")
-                        else:
-                            self._settings_dialog.firefox_variant_combo.setCurrentText("Firefox")
+            if browser in _BROWSER_CHOICES and (not path or os.path.isdir(path)):
+                global BROWSER, BROWSER_DISPLAY
+                BROWSER = saved_browser
+                BROWSER_DISPLAY = saved_browser_display if saved_browser_display in _FIREFOX_FORK_BASE_DIRS else ""
+                if browser == "firefox":
+                    self._settings_dialog.browser_combo.setCurrentText("Firefox-based")
+                    if BROWSER_DISPLAY:
+                        self._settings_dialog.firefox_variant_combo.setCurrentText(BROWSER_DISPLAY)
+                    elif path:
+                        self._settings_dialog.firefox_variant_combo.setCurrentText("Other (browse manually)")
                     else:
-                        self._settings_dialog.browser_combo.setCurrentText(_BROWSER_DISPLAY_NAMES.get(browser, browser))
-                    self._settings_dialog._set_cookie_path(path)
-                    self._settings_dialog._on_cookie_source_changed()
+                        self._settings_dialog.firefox_variant_combo.setCurrentText("Firefox")
+                else:
+                    self._settings_dialog.browser_combo.setCurrentText(_BROWSER_DISPLAY_NAMES.get(browser, browser))
+                self._settings_dialog._set_cookie_path(path)
+                self._settings_dialog._on_cookie_source_changed()
 
         for entry in saved.get("streams", []):
             url = entry["url"]
@@ -2136,6 +2170,18 @@ class StreamDownloaderGUI(QMainWindow):
         )
         self._auto_disabled_banner.setVisible(False)
         vbox.addWidget(self._auto_disabled_banner)
+
+        # ── Browser-not-configured banner (hidden once a browser is set) ──
+        self._browser_unset_banner = QLabel(
+            "ℹ First time use: please open ⚙ Settings and set your Browser and User-Agent options."
+        )
+        self._browser_unset_banner.setWordWrap(True)
+        self._browser_unset_banner.setStyleSheet(
+            "background:#0d2a3a; color:#4FC3F7; font-size:18px; font-weight:bold;"
+            "padding:9px 15px; border-radius:4px; border:1px solid #4FC3F7;"
+        )
+        self._browser_unset_banner.setVisible(False)
+        vbox.addWidget(self._browser_unset_banner)
 
         # ── Splitter: table / log ──
         splitter = QSplitter(Qt.Vertical)
@@ -2428,7 +2474,7 @@ class StreamDownloaderGUI(QMainWindow):
             self._update_auto_disabled_banner()
         del self.stream_items[url]
 
-        for u, si in self.stream_items.items():
+        for si in self.stream_items.values():
             if si.row > row:
                 si.row -= 1
 
@@ -2618,6 +2664,9 @@ class StreamDownloaderGUI(QMainWindow):
         )
         self._auto_disabled_banner.setVisible(True)
 
+    def _update_browser_unset_banner(self):
+        self._browser_unset_banner.setVisible(not BROWSER)
+
     def _on_dl_finished(self, url: str):
         item = self.stream_items.get(url)
         if item:
@@ -2761,10 +2810,9 @@ class StreamDownloaderGUI(QMainWindow):
                 continue
 
             item = self.stream_items.get(url)
-            if item and item.download_active:
-                if time.time() - item.last_check_time > 60:
-                    self.checker.force_check(url)
-                    item.last_check_time = time.time()
+            if item and item.download_active and time.time() - item.last_check_time > 60:
+                self.checker.force_check(url)
+                item.last_check_time = time.time()
 
     def _log_msg(self, message: str, color: str = "#ccc"):
         ts = datetime.now().strftime("%H:%M:%S")
