@@ -845,6 +845,13 @@ class DownloadWorker(QThread):
                 self.resolution_signal.emit(self.stream_url, "", MAX_DOWNLOAD_FPS)
                 self._last_detected_format = None
 
+            if fps and fps > MAX_DOWNLOAD_FPS:
+                self.log_signal.emit(
+                    self.username,
+                    f"⚠ {MAX_DOWNLOAD_FPS}fps not available at {res}; "
+                    f"using {fps}fps instead"
+                )
+
             self._started_at = time.time()
 
             current_time = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
