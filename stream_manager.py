@@ -51,6 +51,7 @@ from datetime import datetime
 from queue import Queue, Empty
 from dataclasses import dataclass
 import traceback
+import requests
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -74,6 +75,67 @@ USER_AGENT = ""
 DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the Settings dialog; persisted across sessions.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
+
+DOWNLOAD_BANDWIDTH_LIMIT_ENABLED = False
+DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S = 0.0
+DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S = 0.0
+DOWNLOAD_BANDWIDTH_HEADROOM_MB_S = 0.25
+DOWNLOAD_BANDWIDTH_PERCENT = 80
+
+
+def format_speed_mb_s(value_mb_s: float) -> str:
+    if value_mb_s <= 0:
+        return "0.0 MB/s"
+    if value_mb_s >= 1024:
+        return f"{value_mb_s / 1024:.2f} GB/s"
+    if value_mb_s >= 1:
+        return f"{value_mb_s:.1f} MB/s"
+    return f"{value_mb_s * 1024:.1f} KB/s"
+
+
+def format_hours_value(value_mb_per_hour: float) -> str:
+    if value_mb_per_hour >= 1024:
+        return f"{value_mb_per_hour / 1024:.2f} GB/h"
+    return f"{value_mb_per_hour:.2f} MB/h"
+
+
+def measure_download_speed(test_size_mb: int = 30) -> float:
+    """Measure the current internet download speed in MB/s using Cloudflare's speed test endpoint.
+
+    The measured speed is used by the optional bandwidth limiter to calculate a safe
+    download limit. The limiter uses this value to control how much bandwidth active
+    streams are allowed to consume and queues additional streams when the limit is reached.
+
+    Returns:
+        The measured download speed in MB/s, or 0.0 if the test fails.
+    """
+    total_requested_bytes = test_size_mb * 1024 * 1024
+    test_url = f"https://speed.cloudflare.com/__down?bytes={total_requested_bytes}"
+
+    try:
+        start_time = time.time()
+        response = requests.get(test_url, stream=True, timeout=30)
+        response.raise_for_status()
+
+        total_bytes = 0
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if not chunk:
+                continue
+            total_bytes += len(chunk)
+
+        elapsed = time.time() - start_time
+
+        if total_bytes == 0 or elapsed <= 0:
+            return 0.0
+
+        speed_mb_s = (total_bytes / elapsed) / (1024 * 1024)
+        return round(speed_mb_s, 2)
+
+    except requests.exceptions.RequestException:
+        return 0.0
+    except Exception:
+        return 0.0
+
 
 # Prevents unstable streams from continuously rejoining the download queue
 # when the system is under heavy load. Prioritizing fewer stable downloads
@@ -256,7 +318,7 @@ SITE_OVERRIDES: dict[str, dict] = {
     # },
 
     # Stripchat.com
-        # yt-dlp currently returns "Unable to extract data".
+        # yt-dlp currently returns "Model is in a private show".
         # Wait for a yt-dlp update before adding site-specific handling.
 
     # cam4.com
@@ -401,6 +463,7 @@ class StreamItem:
     resolution: str = ""
     fps: int = 30  # best-known fps for `resolution` -- probe-based until the live output reveals the real value
     pending_short_check: bool = False  # last download ended early; awaiting post-download status to decide on auto-disable
+    queued: bool = False # True if the stream is currently queued for download due to bandwidth limits
 
 
 # ─────────────────────────────────────────────
@@ -728,7 +791,6 @@ class SharedPreviewWorker(QThread):
                 log_exception("PreviewWorker run loop failed")
 
 
-
 # ─────────────────────────────────────────────
 #  Download worker
 # ─────────────────────────────────────────────
@@ -750,6 +812,8 @@ class DownloadWorker(QThread):
         "invalid data found",
         "application provided invalid",
         "[in#",           # ffmpeg demuxer keepalive noise, e.g. "[in#0/hls @ ...]"
+        "http error 404",  # Normal when an HLS stream ends
+        "404 not found",   # Alternative pattern
     )
 
     # Matches ffmpeg's stream description line, e.g.:
@@ -834,15 +898,28 @@ class DownloadWorker(QThread):
         try:
             if _missing_browser_for_site(self.stream_url):
                 raise RuntimeError(BROWSER_REQUIRED_MSG)
-            self.log_signal.emit(self.username, "🔍 Probing resolution…")
+
+            self.log_signal.emit(self.username, "🔍 Probing stream format…")
             res, fps = self._probe_resolution()
+
             if res:
-                self.log_signal.emit(self.username, f"📐 Resolution: {res} ({fps or '?'} fps, probed)")
-                self.resolution_signal.emit(self.stream_url, res, fps or MAX_DOWNLOAD_FPS)
+                self.log_signal.emit(
+                    self.username,
+                    f"📐 Estimated format: {res} ({fps or '?'} fps)"
+                )
+                self.resolution_signal.emit(
+                    self.stream_url,
+                    res,
+                    fps or MAX_DOWNLOAD_FPS
+                )
                 self._last_detected_format = (res, fps or MAX_DOWNLOAD_FPS)
             else:
-                self.log_signal.emit(self.username, "📐 Resolution unknown")
-                self.resolution_signal.emit(self.stream_url, "", MAX_DOWNLOAD_FPS)
+                self.log_signal.emit(self.username, "📐 Stream format unknown")
+                self.resolution_signal.emit(
+                    self.stream_url,
+                    "",
+                    MAX_DOWNLOAD_FPS
+                )
                 self._last_detected_format = None
 
             if fps and fps > MAX_DOWNLOAD_FPS:
@@ -866,7 +943,6 @@ class DownloadWorker(QThread):
                 ),
                 "--no-overwrites", "--continue", "--no-part",
                 "--skip-unavailable-fragments", "--hls-use-mpegts",
-                "--limit-rate", "2M",
                 "--no-live-from-start",
             ]
             user_agent = get_user_agent()
@@ -1259,7 +1335,6 @@ STATUS_STYLE = {
     StreamStatus.ERROR:   ("⚠ Error",   "#f66", "#3a1a1a"),
 }
 
-
 # ─────────────────────────────────────────────
 #  Persistence
 # ─────────────────────────────────────────────
@@ -1305,7 +1380,6 @@ def load_saved_streams() -> dict:
         pass
     return {"streams": [], "settings": {}}
 
-
 def save_streams(stream_items: dict) -> None:
     payload = {
         "settings": {
@@ -1318,6 +1392,10 @@ def save_streams(stream_items: dict) -> None:
             "browser": BROWSER,
             "browser_display": BROWSER_DISPLAY,
             "cookies_file": COOKIES_FILE,
+            "download_bandwidth_limit_enabled": DOWNLOAD_BANDWIDTH_LIMIT_ENABLED,
+            "download_bandwidth_estimated_mb_s": DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S,
+            "download_bandwidth_safe_limit_mb_s": DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S,
+            "download_bandwidth_percent": DOWNLOAD_BANDWIDTH_PERCENT,
         },
         "streams": [
             {"url": item.url, "auto_start": item.auto_start}
@@ -1392,7 +1470,6 @@ def _read_ini_sections(path: str) -> dict:
                 sections[current][k.strip()] = v.strip()
     return sections
 
-
 def _resolve_default_profile(base_dir: str) -> str:
     """Parse profiles.ini (+ installs.ini) the way Firefox-based browsers
     do, preferring an install-specific default over the plain Default=1
@@ -1419,7 +1496,6 @@ def _resolve_default_profile(base_dir: str) -> str:
         return ""
     full = os.path.join(base_dir, target)
     return full if os.path.isdir(full) else ""
-
 
 def _detect_fork_default_profile(fork_name: str) -> str:
     platform_key = "win32" if sys.platform == "win32" else "darwin" if sys.platform == "darwin" else "linux"
@@ -1473,7 +1549,6 @@ def _seconds_to_cooldown_value_unit(seconds: int) -> tuple[str, str, int]:
     if seconds % 60 == 0:
         return "Custom", "minutes", seconds // 60
     return "Custom", "minutes", max(seconds // 60, 1)
-
 
 class SettingsDialog(QDialog):
     """Setup-once config — output folder, cookies, User-Agent — lives here
@@ -1634,6 +1709,43 @@ class SettingsDialog(QDialog):
         ua_hint.setStyleSheet("color: #888; font-size: 11px;")
         form.addRow("", ua_hint)
 
+        # ── Download Bandwidth ──
+        self.download_speed_test_btn = QPushButton("Test Download Speed")
+        self.download_speed_test_btn.clicked.connect(self._run_download_speed_test)
+        self.download_speed_result_label = QLabel("Speed test not run yet")
+        self.download_speed_result_label.setStyleSheet("color: #888; font-size: 11px;")
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(self.download_speed_test_btn)
+        speed_row.addWidget(self.download_speed_result_label, 1)
+        form.addRow("Download Bandwidth:", speed_row)
+
+        self.download_limit_check = QCheckBox("Limit to")
+        self.download_limit_check.setToolTip("Limit downloads based on estimated connection speed")
+        self.download_limit_check.toggled.connect(self._on_download_bandwidth_toggled)
+        self.download_percent_combo = QComboBox()
+        self.download_percent_combo.addItems(["50%", "60%", "70%", "80%", "90%", "95%", "100%"])
+        self.download_percent_combo.setCurrentText("80%")
+        self.download_percent_combo.currentTextChanged.connect(self._on_bandwidth_percent_changed)
+        limit_row = QHBoxLayout()
+        limit_row.addWidget(self.download_limit_check)
+        limit_row.addWidget(self.download_percent_combo)
+        limit_row.addWidget(QLabel("of measured speed"))
+        limit_row.addStretch(1)
+        form.addRow("", limit_row)
+
+        self.download_limit_label = QLabel("Run a speed test above to enable bandwidth limiting")
+        self.download_limit_label.setStyleSheet("color: #8fb3ff; font-size: 12px;")
+        form.addRow("", self.download_limit_label)
+
+        bandwidth_hint = QLabel(
+            "The speed test downloads 30 MB from Cloudflare to estimate your connection speed. "
+            "The selected percentage is used as the safe bandwidth limit. Additional streams "
+            "are queued when the limit is reached and start automatically as bandwidth becomes available."
+        )
+        bandwidth_hint.setWordWrap(True)
+        bandwidth_hint.setStyleSheet("color: #888; font-size: 11px;")
+        form.addRow("", bandwidth_hint)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.close)
         buttons.accepted.connect(self.close)
@@ -1656,6 +1768,8 @@ class SettingsDialog(QDialog):
         self.browser_combo.currentTextChanged.connect(self._on_cookie_source_changed)
         self.firefox_variant_combo.currentTextChanged.connect(self._on_firefox_variant_changed)
         self.user_agent_input.textChanged.connect(self._on_user_agent_changed)
+
+        self._update_bandwidth_labels()
 
     def _load_from_globals(self):
         self.out_input.setText(DOWNLOAD_OUTPUT)
@@ -1704,6 +1818,8 @@ class SettingsDialog(QDialog):
         self._set_cookie_path(path)
         self._set_cookies_file(COOKIES_FILE)
         self._on_cookie_source_changed()
+        self.download_limit_check.setChecked(DOWNLOAD_BANDWIDTH_LIMIT_ENABLED)
+        self._update_bandwidth_labels()
 
     def _on_output_changed(self, text: str):
         global DOWNLOAD_OUTPUT
@@ -1925,6 +2041,97 @@ class SettingsDialog(QDialog):
         USER_AGENT = text.strip()
         self.settings_changed.emit()
 
+    def _on_download_bandwidth_toggled(self, checked: bool):
+        global DOWNLOAD_BANDWIDTH_LIMIT_ENABLED
+        DOWNLOAD_BANDWIDTH_LIMIT_ENABLED = bool(checked)
+        self._update_bandwidth_labels()
+        self.settings_changed.emit()
+
+    def _update_bandwidth_labels(self):
+        if DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S > 0:
+            safe_limit = DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S if DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S > 0 else (DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S * (DOWNLOAD_BANDWIDTH_PERCENT / 100.0))
+            self.download_limit_label.setText(
+                f"{DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S:.1f} MB/s measured → "
+                f"limit {safe_limit:.1f} MB/s ({DOWNLOAD_BANDWIDTH_PERCENT}%)"
+            )
+        else:
+            self.download_limit_label.setText("Run a speed test above to enable bandwidth limiting")
+
+        self.download_limit_label.setVisible(DOWNLOAD_BANDWIDTH_LIMIT_ENABLED or DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S <= 0)
+        self.download_percent_combo.setEnabled(DOWNLOAD_BANDWIDTH_LIMIT_ENABLED)
+        self.download_speed_test_btn.setEnabled(not bool(getattr(self.parent(), "download_workers", None)))
+
+    def _run_download_speed_test(self):
+        parent = self.parent()
+        if parent and getattr(parent, "download_workers", None):
+            self.download_speed_result_label.setText("Cannot test while downloads are active")
+            self.download_speed_result_label.setStyleSheet("color: #ff8a80; font-size: 11px;")
+            self.download_speed_result_label.setToolTip(
+                "Stop all active downloads first for the most accurate result."
+            )
+            return
+
+        self.download_speed_result_label.setText("Testing connection speed…")
+        self.download_speed_result_label.setStyleSheet("color: #8fb3ff; font-size: 11px;")
+        self.download_speed_result_label.setToolTip("")
+        self.download_speed_test_btn.setEnabled(False)
+
+        self._speed_test_worker = SpeedTestWorker()
+        self._speed_test_worker.result_signal.connect(self._on_download_speed_test_result)
+        self._speed_test_worker.error_signal.connect(self._on_download_speed_test_error)
+        self._speed_test_worker.finished.connect(self._update_bandwidth_labels)
+        self._speed_test_worker.finished.connect(self._speed_test_worker.deleteLater)
+        self._speed_test_worker.start()
+
+    def _on_download_speed_test_result(self, speed_mb_s: float):
+        global DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S, DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S
+        DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S = float(speed_mb_s)
+        # Calculate safe limit based on the current percentage
+        DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S = max(0.0, float(speed_mb_s) * (DOWNLOAD_BANDWIDTH_PERCENT / 100.0))
+        self.download_speed_result_label.setText(
+            f"Speed test completed: {DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S:.1f} MB/s"
+        )
+        self.download_speed_result_label.setStyleSheet("color: #7ae8a6; font-size: 11px;")
+        self._update_bandwidth_labels()
+        self.settings_changed.emit()
+
+    def _on_download_speed_test_error(self, message: str):
+        self.download_speed_result_label.setText("Speed test failed — please try again")
+        self.download_speed_result_label.setStyleSheet("color: #ff8a80; font-size: 11px;")
+        self.download_speed_result_label.setToolTip(message)
+
+    def _on_bandwidth_percent_changed(self, percent_text: str):
+        """Handle bandwidth percentage dropdown change."""
+        global DOWNLOAD_BANDWIDTH_PERCENT
+        # Remove the '%' sign and convert to int
+        percent = int(percent_text.replace("%", ""))
+        DOWNLOAD_BANDWIDTH_PERCENT = percent
+        
+        # Recalculate the safe limit based on the new percentage
+        if DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S > 0:
+            self._recalculate_safe_limit()
+        
+        self.settings_changed.emit()
+
+    def _recalculate_safe_limit(self):
+        """Recalculate the safe limit based on the current percentage."""
+        global DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S
+        if DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S > 0:
+            DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S = max(0.0, DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S * (DOWNLOAD_BANDWIDTH_PERCENT / 100.0))
+            self._update_bandwidth_labels()
+
+class SpeedTestWorker(QThread):
+    result_signal = Signal(float)
+    error_signal = Signal(str)
+
+    def run(self):
+        try:
+            result = measure_download_speed(test_size_mb=30)
+            if result <= 0:
+                raise RuntimeError("download speed test returned zero")
+            self.result_signal.emit(float(result))
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
 
 class StreamDownloaderGUI(QMainWindow):
     def __init__(self):
@@ -1966,6 +2173,7 @@ class StreamDownloaderGUI(QMainWindow):
         self._settings_dialog = SettingsDialog(self)
         self._settings_dialog.settings_changed.connect(self._save)
         self._settings_dialog.settings_changed.connect(self._update_browser_unset_banner)
+        self._settings_dialog.settings_changed.connect(self._update_download_info)
         self._settings_dialog.cookie_access_confirmed_broken.connect(self._maybe_show_chromium_cookie_dialog)
 
         # Convenience references so the rest of the class can keep reading
@@ -1977,6 +2185,7 @@ class StreamDownloaderGUI(QMainWindow):
         self._build_ui()
         self.setStyleSheet(DARK)
         self._load_saved_streams()
+        self._update_download_info()
         self._update_browser_unset_banner()
 
         QApplication.instance().aboutToQuit.connect(self._shutdown_workers)
@@ -2091,10 +2300,47 @@ class StreamDownloaderGUI(QMainWindow):
                 self._settings_dialog._set_cookie_path(path)
                 self._settings_dialog._on_cookie_source_changed()
 
+        global DOWNLOAD_BANDWIDTH_LIMIT_ENABLED, DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S, DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S, DOWNLOAD_BANDWIDTH_PERCENT
+
+        saved_bandwidth_enabled = settings.get("download_bandwidth_limit_enabled", False)
+        try:
+            DOWNLOAD_BANDWIDTH_LIMIT_ENABLED = bool(saved_bandwidth_enabled)
+        except (TypeError, ValueError):
+            DOWNLOAD_BANDWIDTH_LIMIT_ENABLED = False
+
+        saved_bandwidth_estimate = settings.get("download_bandwidth_estimated_mb_s", 0)
+        try:
+            DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S = float(saved_bandwidth_estimate)
+        except (TypeError, ValueError):
+            DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S = 0.0
+
+        saved_bandwidth_limit = settings.get("download_bandwidth_safe_limit_mb_s", 0)
+        try:
+            DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S = float(saved_bandwidth_limit)
+        except (TypeError, ValueError):
+            DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S = 0.0
+
+        saved_percent = settings.get("download_bandwidth_percent", 80)
+        try:
+            DOWNLOAD_BANDWIDTH_PERCENT = int(saved_percent)
+        except (TypeError, ValueError):
+            DOWNLOAD_BANDWIDTH_PERCENT = 80
+
+        self._settings_dialog.download_limit_check.setChecked(DOWNLOAD_BANDWIDTH_LIMIT_ENABLED)
+        self._settings_dialog.download_percent_combo.setCurrentText(f"{DOWNLOAD_BANDWIDTH_PERCENT}%")
+        self._settings_dialog._update_bandwidth_labels()
+
+        if DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S > 0:
+            self._settings_dialog.download_speed_result_label.setText(
+                f"Speed test completed: {DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S:.1f} MB/s"
+            )
+            self._settings_dialog.download_speed_result_label.setStyleSheet("color: #7ae8a6; font-size: 11px;")
+
         for entry in saved.get("streams", []):
             url = entry["url"]
             auto = entry["auto_start"]
             self._add_stream(url=url, auto_start=auto, silent=True)
+
         if saved:
             restored_count = len(saved.get("streams", []))
             if restored_count:
@@ -2205,12 +2451,12 @@ class StreamDownloaderGUI(QMainWindow):
 
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)   # Preview
-        hh.setSectionResizeMode(1, QHeaderView.Fixed)   # Site  <-- NEW
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)   # Site
         hh.setSectionResizeMode(2, QHeaderView.Stretch) # Username
         hh.setSectionResizeMode(3, QHeaderView.Fixed)   # Status
         hh.setSectionResizeMode(4, QHeaderView.Fixed)   # Duration
         hh.setSectionResizeMode(5, QHeaderView.Fixed)   # Res
-        hh.setSectionResizeMode(6, QHeaderView.Fixed)   # FPS  <-- NEW
+        hh.setSectionResizeMode(6, QHeaderView.Fixed)   # FPS
         hh.setSectionResizeMode(7, QHeaderView.Fixed)   # Auto
         hh.setSectionResizeMode(8, QHeaderView.Fixed)   # DL
         hh.setSectionResizeMode(9, QHeaderView.Fixed)   # Start
@@ -2218,11 +2464,11 @@ class StreamDownloaderGUI(QMainWindow):
         hh.setSectionResizeMode(11, QHeaderView.Fixed)  # ✕
 
         self._table.setColumnWidth(0, 112)   # Preview
-        self._table.setColumnWidth(1, 90)    # Site  <-- NEW
+        self._table.setColumnWidth(1, 90)    # Site
         self._table.setColumnWidth(3, 90)    # Status
         self._table.setColumnWidth(4, 90)    # Duration
         self._table.setColumnWidth(5, 80)    # Res
-        self._table.setColumnWidth(6, 48)    # FPS  <-- NEW
+        self._table.setColumnWidth(6, 48)    # FPS
         self._table.setColumnWidth(7, 48)    # Auto
         self._table.setColumnWidth(8, 36)    # DL
         self._table.setColumnWidth(9, 85)    # Start
@@ -2269,7 +2515,7 @@ class StreamDownloaderGUI(QMainWindow):
         self._update_download_info()
 
         # Tooltips
-        self._url_input.setToolTip("Enter a Chaturbate stream URL\nExample: https://chaturbate.com/username/")
+        self._url_input.setToolTip("Enter a stream URL\nExample: https://chaturbate.com/username/")
         settings_btn.setToolTip("Download output folder, cookies, and User-Agent")
         add_btn.setToolTip("Add the stream to the monitoring list")
         stop_all_btn.setToolTip("Stop ALL active downloads immediately")
@@ -2306,7 +2552,7 @@ class StreamDownloaderGUI(QMainWindow):
         )
         self._table.setCellWidget(row, 0, thumb)
 
-        # Col 1 — site  <-- NEW
+        # Col 1 — site
         site_lbl = QLabel(extract_site(url))
         site_lbl.setAlignment(Qt.AlignCenter)
         site_lbl.setToolTip(url)
@@ -2330,13 +2576,13 @@ class StreamDownloaderGUI(QMainWindow):
         self._table.setCellWidget(row, 4, dur)
         self.download_timers[url] = dur
 
-            # Col 5 — resolution
+        # Col 5 — resolution
         res_lbl = QLabel("—")
         res_lbl.setAlignment(Qt.AlignCenter)
         res_lbl.setStyleSheet("font-size:11px; color:#555; font-family:'Courier New',monospace;")
         self._table.setCellWidget(row, 5, res_lbl)
 
-        # Col 6 — FPS  <-- NEW
+        # Col 6 — FPS
         fps_lbl = QLabel("—")
         fps_lbl.setAlignment(Qt.AlignCenter)
         fps_lbl.setStyleSheet("font-size:11px; color:#555; font-family:'Courier New',monospace;")
@@ -2416,6 +2662,27 @@ class StreamDownloaderGUI(QMainWindow):
         item = self.stream_items.get(url)
         if not item:
             return
+
+        if item.current_status != StreamStatus.ONLINE:
+            self._log_msg(
+                f"⚠ Can't start {item.username}: stream is not currently online",
+                "#FF9800"
+            )
+            return
+
+        if DOWNLOAD_BANDWIDTH_LIMIT_ENABLED and DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S > 0:
+            current_need = self._active_download_need_mb_s()
+            stream_need = self._stream_need_mb_s(item)
+            queue_limit = DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S + DOWNLOAD_BANDWIDTH_HEADROOM_MB_S
+            if current_need + stream_need > queue_limit:
+                item.queued = True
+                self._log_msg(
+                    f"⏳ Queued {item.username}: needs {stream_need:.1f} MB/s, limit is {DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S:.1f} MB/s",
+                    "#FF9800"
+                )
+                self._update_download_info()
+                return
+            item.queued = False
 
         worker = DownloadWorker(url, item.username, self._out_input.text().strip() or "Downloads")
         worker.setParent(self)
@@ -2560,9 +2827,13 @@ class StreamDownloaderGUI(QMainWindow):
         if status == StreamStatus.ONLINE and item.auto_start and not item.download_active:
             self._log_msg(f"🎬 Auto-start: {item.username}", "#4CAF50")
             self._manual_start(url)
-        elif status in (StreamStatus.OFFLINE, StreamStatus.PRIVATE, StreamStatus.AWAY) and item.download_active:
-            self._log_msg(f"🛑 Force stop: {item.username} ({status.value})", "#F44336")
-            self._stop_download(url)
+        elif status in (StreamStatus.OFFLINE, StreamStatus.PRIVATE, StreamStatus.AWAY):
+            if item.queued:
+                item.queued = False
+                self._log_msg(f"🧹 Cleared queued state for {item.username}: stream went {status.value}", "#777")
+            if item.download_active:
+                self._log_msg(f"🛑 Force stop: {item.username} ({status.value})", "#F44336")
+                self._stop_download(url)
 
     def _on_resolution(self, url: str, res: str, fps: int):
         item = self.stream_items.get(url)
@@ -2585,7 +2856,7 @@ class StreamDownloaderGUI(QMainWindow):
                     "font-size:11px; color:#555; font-family:'Courier New',monospace;"
                 )
 
-        # Set the FPS column (col 6) - NEW
+        # Set the FPS column (col 6)
         fps_lbl = self._table.cellWidget(item.row, 6)
         if fps_lbl:
             if fps and fps > 0:
@@ -2712,6 +2983,8 @@ class StreamDownloaderGUI(QMainWindow):
             item.download_start_time = 0
             self._update_dl_ui(url, False)
         self._update_download_info()
+        self._process_queued_streams()
+        self._settings_dialog._update_bandwidth_labels()
 
     def _format_size(self, bytes_value: float) -> str:
         if bytes_value >= 1024 * 1024 * 1024:
@@ -2722,45 +2995,67 @@ class StreamDownloaderGUI(QMainWindow):
             return f"{bytes_value / 1024:.2f} KB"
         return f"{bytes_value:.0f} B"
 
+    def _stream_need_mb_s(self, item: Optional[StreamItem]) -> float:
+        if not item:
+            return 0.0
+        resolution = item.resolution or MAX_DOWNLOAD_RESOLUTION
+        fps = item.fps or MAX_DOWNLOAD_FPS
+        bitrate_kbps = get_bitrate_kbps(resolution, fps)
+        if bitrate_kbps <= 0:
+            return 0.0
+        return (bitrate_kbps / 1000.0) / 8.0
+
+    def _active_download_need_mb_s(self) -> float:
+        total = 0.0
+        for item in self.stream_items.values():
+            if item.download_active:
+                total += self._stream_need_mb_s(item)
+        return total
+
+    def _queued_stream_count(self) -> int:
+        return sum(1 for item in self.stream_items.values() if item.queued and not item.download_active)
+
+    def _process_queued_streams(self):
+        if not DOWNLOAD_BANDWIDTH_LIMIT_ENABLED or DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S <= 0:
+            return
+        for url, item in list(self.stream_items.items()):
+            if item.queued and not item.download_active and self._stream_need_mb_s(item) > 0:
+                current_need = self._active_download_need_mb_s()
+                queue_limit = DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S + DOWNLOAD_BANDWIDTH_HEADROOM_MB_S
+                if current_need + self._stream_need_mb_s(item) <= queue_limit:
+                    item.queued = False
+                    self._log_msg(f"▶ Resuming queued stream: {item.username}", "#4CAF50")
+                    self._manual_start(url)
+                    return
+
     def _estimate_download_info(self) -> tuple[str, float, float]:
         active_items = [item for item in self.stream_items.values() if item.download_active]
         if not active_items:
             return "No active downloads", 0.0, 0.0
 
         total_mbps = 0.0
-        details: list[str] = []
         for item in active_items:
-            resolution = item.resolution or ""
-            kbps = get_bitrate_kbps(resolution, item.fps)
-            if kbps <= 0:
-                details.append(f"{item.username}: unknown")
-                continue
-            mbps = kbps / 1000.0
-            total_mbps += mbps
-            size_per_hour_mb = mbps * 3600 / 8.0
-            if size_per_hour_mb >= 1024:
-                size_label = f"{size_per_hour_mb / 1024:.2f} GB/h"
-            else:
-                size_label = f"{size_per_hour_mb:.2f} MB/h"
-            fps_note = f" @{item.fps}fps" if item.fps and item.fps > 30 else ""
-            details.append(f"{item.username}: {resolution}{fps_note} → {size_label}")
+            total_mbps += self._stream_need_mb_s(item) * 8.0
 
         total_per_hour_mb = total_mbps * 3600 / 8.0
-        if total_per_hour_mb >= 1024:
-            total_label = f"{total_per_hour_mb / 1024:.2f} GB/h"
-        else:
-            total_label = f"{total_per_hour_mb:.2f} MB/h"
+        total_label = format_hours_value(total_per_hour_mb)
 
         required_speed_mb_s = total_mbps / 8.0
-        if required_speed_mb_s >= 1:
-            speed_label = f"{required_speed_mb_s:.2f} MB/s"
-        else:
-            speed_label = f"{required_speed_mb_s * 1024:.2f} KB/s"
+        speed_label = format_speed_mb_s(required_speed_mb_s)
 
-        summary = f"{len(active_items)} active • total {total_label} • needed {speed_label}"
+        if DOWNLOAD_BANDWIDTH_LIMIT_ENABLED and DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S > 0:
+            capacity_label = format_speed_mb_s(DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S)
+            summary = f"{len(active_items)} active • Total {total_label} • Using {speed_label} / {capacity_label}"
+            queued_count = self._queued_stream_count()
+            if queued_count > 0:
+                summary += f" • {queued_count} queued"
+            return summary, total_per_hour_mb, required_speed_mb_s
+
+        summary = f"{len(active_items)} active • Total {total_label} • {speed_label}"
         return summary, total_per_hour_mb, required_speed_mb_s
 
     def _update_download_info(self):
+        self._process_queued_streams()
         summary, _, _ = self._estimate_download_info()
         if self._download_info_label:
             self._download_info_label.setText(f"Download info: {summary}")
@@ -2878,7 +3173,6 @@ class StreamDownloaderGUI(QMainWindow):
         self._save()
         event.accept()
 
-
 # ─────────────────────────────────────────────
 #  Entry point
 # ─────────────────────────────────────────────
@@ -2889,7 +3183,6 @@ def main():
     win = StreamDownloaderGUI()
     win.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
