@@ -10,7 +10,7 @@ fi
 # Activate and install dependencies
 source Stream_Venv/bin/activate
 pip install --upgrade pip
-pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
+pip install PySide6 psutil requests yt-dlp "curl_cffi<0.16"
 
 chmod +x stream_manager.py
 
