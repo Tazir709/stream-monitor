@@ -28,7 +28,7 @@ if errorlevel 1 (
 )
 
 python -m pip install --upgrade pip
-pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
+pip install PySide6 psutil requests yt-dlp "curl_cffi<0.16"
 if errorlevel 1 (
     echo [ERROR] Dependency install failed. See the output above.
     goto :error
