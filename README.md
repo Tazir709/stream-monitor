@@ -33,9 +33,7 @@ The application showing multiple stream states:
 
 
 Stream-monitor settings:
-<img width="1015" height="1017" alt="2" src="https://github.com/user-attachments/assets/a0e63ea2-393f-4cd5-ab06-e6f6e10d5ccd" />
-
-
+<img width="1022" height="847" alt="2" src="https://github.com/user-attachments/assets/6662865c-b07b-4da8-883b-21deac0208e8" />
 
 
 
