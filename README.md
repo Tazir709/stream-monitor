@@ -33,7 +33,8 @@ The application showing multiple stream states:
 
 
 Stream-monitor settings:
-<img width="1023" height="814" alt="2" src="https://github.com/user-attachments/assets/fa0b86ba-4219-475d-983b-e1bb3990605b" />
+<img width="1015" height="1017" alt="2" src="https://github.com/user-attachments/assets/a0e63ea2-393f-4cd5-ab06-e6f6e10d5ccd" />
+
 
 
 
@@ -85,7 +86,7 @@ setup_windows.bat
 ```powershell
 python -m venv Stream_Venv
 Stream_Venv\Scripts\activate
-pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
+pip install PySide6 psutil requests yt-dlp "curl_cffi<0.16"
 ```
 
 **macOS / Linux — script:**
@@ -97,7 +98,7 @@ chmod +x setup.sh
 ```bash
 python3 -m venv Stream_Venv
 source Stream_Venv/bin/activate
-pip install PySide6 psutil yt-dlp "curl_cffi<0.16"
+pip install PySide6 psutil requests yt-dlp "curl_cffi<0.16"
 ```
 
 > **What is a venv?** A virtual environment is an isolated folder that holds Python packages just for this project, so they don't clash with anything else on your system or other Python projects you have installed. Everything `pip install`s above goes into the `Stream_Venv` folder, not system-wide.
@@ -151,6 +152,8 @@ Picking `Firefox-based` reveals a second dropdown: `Firefox`, `Floorp`, `Zen`, `
 **Cookies file** (Windows only, Chrome/Chromium/Edge/Brave/Opera) — this row only appears on Windows when one of those browsers is selected, since Chromium-based browsers can fail to expose cookies to yt-dlp there (a known Windows-only limitation, not a bug in this app — closing the browser doesn't reliably fix it). If that happens, export your cookies (see [Exporting cookies](#-exporting-cookies) below) and select the file here — it's used instead of live browser extraction. Click **✕** to clear it and go back to normal extraction. Not needed at all on Linux/macOS, or for Firefox-based browsers.
 
 **User-Agent** — a real browser's user-agent string, ideally matching the browser your cookies came from. Often needed to get past Cloudflare's Turnstile check, even with valid cookies — this has come up on macOS in particular. Find yours by searching "what is my user agent", or visit whatsmyua.info. Leave it blank to use yt-dlp's default.
+
+**Download bandwidth** — optionally limit the total bandwidth used by active downloads so the app doesn't saturate your connection. Click **Test Download Speed** to measure your current download speed using a 30 MB download from Cloudflare, then enable **Limit to** and choose a percentage of the measured speed (50%, 60%, 70%, 80%, 90%, 95%, or 100%). When the available bandwidth is fully allocated, additional streams are automatically queued and started as bandwidth becomes available. The measured speed and bandwidth limit are saved between sessions. For the most accurate result, stop any active downloads before running the speed test.
 
 ---
 
