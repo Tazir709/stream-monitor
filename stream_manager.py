@@ -846,6 +846,7 @@ class DownloadWorker(QThread):
         self.output_path = os.path.join(output_path, username)
         self.process: Optional[subprocess.Popen] = None
         self.is_running  = False
+        self.manual_stop = False  # set when stop() is called by the user; suppresses the short-download auto-disable check
         self._rate_limiter = RateLimiter(2.0)
         self._line_queue: Queue = Queue()
         self._started_at = 0.0
@@ -1046,7 +1047,7 @@ class DownloadWorker(QThread):
             except subprocess.TimeoutExpired:
                 pass
 
-            if self._started_at:
+            if self._started_at and not self.manual_stop:
                 elapsed = int(time.time() - self._started_at)
                 if elapsed < AUTO_DOWNLOAD_DISABLE_SECONDS:
                     self.short_download_signal.emit(self.stream_url, elapsed)
@@ -1071,6 +1072,7 @@ class DownloadWorker(QThread):
             return
 
         self.log_signal.emit(self.username, "⏹ Stopping download…")
+        self.manual_stop = True
         self.is_running = False
 
         try:
