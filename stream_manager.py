@@ -234,6 +234,19 @@ def get_bitrate_kbps(resolution: str, fps: int) -> int:
     return int(sum(estimates) / len(estimates))
 
 
+def estimate_bandwidth_need_mb_s(resolution: str, fps: int) -> float:
+    """Estimated download throughput for a resolution/fps, in MB/s.
+
+    Shared by the queue admission check (StreamDownloaderGUI._stream_need_mb_s)
+    and the per-download rate cap (DownloadWorker.run) so both always agree
+    on what a stream "needs".
+    """
+    bitrate_kbps = get_bitrate_kbps(resolution or MAX_DOWNLOAD_RESOLUTION, fps or MAX_DOWNLOAD_FPS)
+    if bitrate_kbps <= 0:
+        return 0.0
+    return (bitrate_kbps / 1000.0) / 8.0
+
+
 def get_download_format_selector() -> str:
     max_height = int(MAX_DOWNLOAD_RESOLUTION.split("x")[1])
     max_fps = MAX_DOWNLOAD_FPS
@@ -945,6 +958,14 @@ class DownloadWorker(QThread):
                 "--skip-unavailable-fragments", "--hls-use-mpegts",
                 "--no-live-from-start",
             ]
+            if DOWNLOAD_BANDWIDTH_LIMIT_ENABLED and DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S > 0:
+                # Cap this stream at its own admission-time estimate so actual
+                # throughput can't run past what the queue already assumed it
+                # would use -- without this, admission control alone can't
+                # keep total usage under the configured limit.
+                need_mb_s = estimate_bandwidth_need_mb_s(res, fps)
+                if need_mb_s > 0:
+                    cmd.extend(["--limit-rate", f"{need_mb_s:.2f}M"])
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
@@ -2998,12 +3019,7 @@ class StreamDownloaderGUI(QMainWindow):
     def _stream_need_mb_s(self, item: Optional[StreamItem]) -> float:
         if not item:
             return 0.0
-        resolution = item.resolution or MAX_DOWNLOAD_RESOLUTION
-        fps = item.fps or MAX_DOWNLOAD_FPS
-        bitrate_kbps = get_bitrate_kbps(resolution, fps)
-        if bitrate_kbps <= 0:
-            return 0.0
-        return (bitrate_kbps / 1000.0) / 8.0
+        return estimate_bandwidth_need_mb_s(item.resolution, item.fps)
 
     def _active_download_need_mb_s(self) -> float:
         total = 0.0
