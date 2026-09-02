@@ -477,8 +477,8 @@ class StreamItem:
     download_start_time: float = 0
     resolution: str = ""
     fps: int = 30  # best-known fps for `resolution` -- probe-based until the live output reveals the real value
-    pending_short_check: bool = False  # last download ended early; awaiting post-download status to decide on auto-disable
-    queued: bool = False # True if the stream is currently queued for download due to bandwidth limits
+    pending_short_check: bool = False
+    queued: bool = False
 
 
 # ─────────────────────────────────────────────
@@ -506,9 +506,7 @@ def extract_username(url: str) -> str:
     return match.group(1) if match else url
 
 
-# Friendly display names for known sites, keyed the same way as
-# SITE_OVERRIDES (a substring matched against the URL's host). Sites with
-# no entry here just fall back to their bare domain label (e.g. "example").
+# Friendly display names for known sites
 SITE_DISPLAY_NAMES: dict[str, str] = {
     "chaturbate.com": "Chaturbate",
     "camsoda.com": "Camsoda",
@@ -550,15 +548,11 @@ def _get_stripchat_preview_frame(url: str) -> Optional[tuple[bytes, int, int]]:
         print(f"[Debug] Stripchat preview skipped: url={url!r}, helper_available={get_preview_frame is not None}")
         return None
     try:
-        print(f"[Debug] Stripchat preview fetch start: {url}")
         frame = get_preview_frame(url, target_height=720, user_agent=get_user_agent())
         if not frame:
             print(f"[Debug] Stripchat preview returned None for: {url}")
             return None
-        print(
-            f"[Debug] Stripchat preview resolved: width={frame.width}, "
-            f"height={frame.height}, image_bytes={len(frame.image)}"
-        )
+            
         return frame.image, frame.width, frame.height
     except Exception as e:
         print(f"[Debug] Stripchat preview failed for {url}: {e!r}")
@@ -715,7 +709,6 @@ class SharedPreviewWorker(QThread):
 
         if "stripchat.com" in (page_url or "").lower():
             try:
-                print(f"[Debug] SharedPreviewWorker Stripchat branch: {page_url}")
                 frame_data = _get_stripchat_preview_frame(page_url)
                 if frame_data:
                     self._stream_url_cache[page_url] = ("stripchat_preview", time.time() + self.HLS_CACHE_LIFETIME)
@@ -758,7 +751,6 @@ class SharedPreviewWorker(QThread):
 
     def _capture(self, page_url: str):
         if "stripchat.com" in (page_url or "").lower():
-            print(f"[Debug] SharedPreviewWorker Stripchat capture: {page_url}")
             frame_data = _get_stripchat_preview_frame(page_url)
             if frame_data is None:
                 print(f"[Debug] Stripchat preview frame was empty for {page_url}")
@@ -773,7 +765,6 @@ class SharedPreviewWorker(QThread):
                 if not px.isNull():
                     self._pixmap_cache[page_url] = px
                     self.preview_updated.emit(page_url, px)
-                    print(f"[Debug] Stripchat preview updated pixmap for {page_url}")
                     return
                 print(f"[Debug] Stripchat preview produced null pixmap for {page_url}")
             except Exception as e:
@@ -829,7 +820,6 @@ class SharedPreviewWorker(QThread):
                     if not px.isNull():
                         self._pixmap_cache[page_url] = px
                         self.preview_updated.emit(page_url, px)
-                        print(f"[Debug] ffmpeg preview updated pixmap for {page_url}")
                     else:
                         print(f"[Debug] ffmpeg preview produced null pixmap for {page_url}")
                 else:
@@ -911,7 +901,7 @@ class DownloadWorker(QThread):
         "application provided invalid",
         "[in#",           # ffmpeg demuxer keepalive noise, e.g. "[in#0/hls @ ...]"
         "http error 404",  # Normal when an HLS stream ends
-        "404 not found",   # Alternative pattern
+        "404 not found",
     )
 
     # Matches ffmpeg's stream description line, e.g.:
@@ -931,7 +921,7 @@ class DownloadWorker(QThread):
         self.output_path = os.path.join(output_path, username)
         self.process: Optional[subprocess.Popen] = None
         self.is_running  = False
-        self.manual_stop = False  # set when stop() is called by the user; suppresses the short-download auto-disable check
+        self.manual_stop = False
         self._rate_limiter = RateLimiter(2.0)
         self._line_queue: Queue = Queue()
         self._started_at = 0.0
@@ -973,7 +963,6 @@ class DownloadWorker(QThread):
         self.is_running = True
         self.log_signal.emit(self.username, "🧩 Using Stripchat native downloader…")
 
-        # Use a flag to track if we should stop
         self._stripchat_stop = False
 
         # Create the downloader
@@ -1392,8 +1381,6 @@ class StreamChecker(QThread):
                 print(f"[Debug] Stripchat live check failed for {url}: {exc!r}")
                 return StreamStatus.ERROR, "❌ Stripchat check failed"
 
-        # ... rest of the method for other sites
-
         if _missing_browser_for_site(url):
             return StreamStatus.ERROR, f"⚠ {BROWSER_REQUIRED_MSG}"
         try:
@@ -1418,7 +1405,6 @@ class StreamChecker(QThread):
                 stderr_lower = stderr.lower()
                 url_lower = url.lower()
 
-                # Camsoda: offline/no active stream
                 if "camsoda" in url_lower and "no active streams found" in stderr_lower:
                     return StreamStatus.OFFLINE, "💤 Offline"
 
@@ -3204,10 +3190,8 @@ class StreamDownloaderGUI(QMainWindow):
     def _cleanup_download(self, url: str):
         worker = self.download_workers.get(url)
         if worker:
-            print(f"[Debug] _cleanup_download: stopping worker {worker.objectName()}")
             worker.stop()
             if not worker.wait(5000):
-                print(f"[Debug] _cleanup_download: worker {worker.objectName()} did not exit in time, terminating")
                 worker.terminate()
                 worker.wait(2000)
             worker.deleteLater()
@@ -3300,14 +3284,14 @@ class StreamDownloaderGUI(QMainWindow):
             return
         row = item.row
 
-        dl_lbl = self._table.cellWidget(row, 8)  # Was col 7, now col 8
+        dl_lbl = self._table.cellWidget(row, 8)
         if dl_lbl:
             dl_lbl.setText("●" if active else "—")
             dl_lbl.setStyleSheet(
                 f"color:{'#4fc' if active else '#444'}; font-size:{'16' if active else '14'}px;"
             )
 
-        for col, enabled in ((9, not active), (10, active)):  # Start/Stop columns shifted
+        for col, enabled in ((9, not active), (10, active)):
             btn = self._table.cellWidget(row, col)
             if btn:
                 btn.setEnabled(enabled)
