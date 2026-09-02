@@ -63,6 +63,21 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QDir, QUrl
 from PySide6.QtGui import QImage, QPixmap, QColor, QDesktopServices
 
+try:
+    from sites.stripchat import (
+        get_stream_info,
+        get_preview_frame,
+        StripchatDownloader,
+        DownloadRequest,
+        FFMPEG_HAS_NATIVE_H264_DECODER,
+    )
+except ImportError:  # pragma: no cover - used when the helper module is unavailable
+    get_stream_info = None
+    get_preview_frame = None
+    StripchatDownloader = None
+    DownloadRequest = None
+    FFMPEG_HAS_NATIVE_H264_DECODER = False
+
 
 # ─────────────────────────────────────────────
 #  Configuration
@@ -323,32 +338,15 @@ SITE_OVERRIDES: dict[str, dict] = {
         "impersonate": True,
     },
 
+    # Stripchat.com is handled by the dedicated helper module (stripchat.py) instead of yt-dlp,
+    # so no override is needed here.
+
     # "othersite.com": {
     #     "impersonate": "chrome",  # force a specific target regardless of Settings
     #     "extra_args": ["--some-flag", "value"],
     #     "ffmpeg_extra_args": ["-some-ffmpeg-flag", "value"],
     #     "referer": "https://www.othersite.com/",
     # },
-
-    # Stripchat.com
-        # yt-dlp currently returns "Model is in a private show".
-        # Wait for a yt-dlp update before adding site-specific handling.
-
-    # cam4.com
-        # CAM4 has inconsistent handling of private/spy streams. yt-dlp can report
-        # these streams as "is_live" even when ffmpeg cannot actually access the
-        # HLS stream, causing the preview to fail or time out.
-        #
-        # CAM4 could also report HTTP 400/403 errors or JSON parsing errors for
-        # certain profiles depending on their current stream state.
-        #
-        # Auto-download required additional CAM4-specific handling so downloads
-        # would wait for a successful preview confirmation rather than starting
-        # immediately when yt-dlp reported "is_live".
-        #
-        # CAM4 support has therefore been disabled for now to avoid unreliable
-        # previews, short/incomplete downloads, and confusing status changes.
-        # Revisit this if yt-dlp or CAM4's stream handling becomes more reliable.
 }
 
 
@@ -443,6 +441,10 @@ def _subprocess_kwargs() -> dict:
     """
     kwargs: dict = {}
     if IS_WINDOWS:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        kwargs["startupinfo"] = startupinfo
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     return kwargs
 
@@ -511,6 +513,7 @@ SITE_DISPLAY_NAMES: dict[str, str] = {
     "chaturbate.com": "Chaturbate",
     "camsoda.com": "Camsoda",
     "bongacams.com": "BongaCams",
+    "stripchat.com": "Stripchat",
 }
 
 
@@ -528,6 +531,38 @@ def extract_site(url: str) -> str:
     domain = match.group(1) if match else ""
     label = domain.split(".")[0] if domain else ""
     return label.capitalize() if label else "Unknown"
+
+
+def _get_stripchat_stream_info(url: str):
+    """Resolve Stripchat stream metadata using the dedicated helper."""
+    if not url or "stripchat.com" not in url.lower() or get_stream_info is None:
+        return None
+    try:
+        return get_stream_info(url, user_agent=get_user_agent())
+    except Exception as e:
+        print(f"[Debug] Stripchat stream info failed for {url}: {e!r}")
+        return None
+
+
+def _get_stripchat_preview_frame(url: str) -> Optional[tuple[bytes, int, int]]:
+    """Return decoded RGB preview bytes from Stripchat's preview-frame helper."""
+    if not url or "stripchat.com" not in url.lower() or get_preview_frame is None:
+        print(f"[Debug] Stripchat preview skipped: url={url!r}, helper_available={get_preview_frame is not None}")
+        return None
+    try:
+        print(f"[Debug] Stripchat preview fetch start: {url}")
+        frame = get_preview_frame(url, target_height=720, user_agent=get_user_agent())
+        if not frame:
+            print(f"[Debug] Stripchat preview returned None for: {url}")
+            return None
+        print(
+            f"[Debug] Stripchat preview resolved: width={frame.width}, "
+            f"height={frame.height}, image_bytes={len(frame.image)}"
+        )
+        return frame.image, frame.width, frame.height
+    except Exception as e:
+        print(f"[Debug] Stripchat preview failed for {url}: {e!r}")
+        return None
 
 
 def log_exception(prefix: str) -> None:
@@ -612,8 +647,8 @@ class CookieProbeWorker(QThread):
 class SharedPreviewWorker(QThread):
     preview_updated = Signal(str, QPixmap)
 
-    CAPTURE_INTERVAL  = 90
-    HLS_CACHE_LIFETIME = 150
+    CAPTURE_INTERVAL, HLS_CACHE_LIFETIME = 90, 5
+
 
     def __init__(self):
         super().__init__()
@@ -677,9 +712,24 @@ class SharedPreviewWorker(QThread):
             stream_url, expiry = cached
             if time.time() < expiry:
                 return stream_url
+
+        if "stripchat.com" in (page_url or "").lower():
+            try:
+                print(f"[Debug] SharedPreviewWorker Stripchat branch: {page_url}")
+                frame_data = _get_stripchat_preview_frame(page_url)
+                if frame_data:
+                    self._stream_url_cache[page_url] = ("stripchat_preview", time.time() + self.HLS_CACHE_LIFETIME)
+                    self._stripchat_preview_cache[page_url] = frame_data
+                    return "stripchat_preview"
+                print(f"[Debug] Stripchat preview data unavailable for {page_url}; no preview available")
+            except Exception as e:
+                print(f"[Debug] Stripchat preview failed: {e!r}")
+                return None
+
         if _missing_browser_for_site(page_url):
             print(f"[Debug] PreviewWorker _get_stream_url skipped for {page_url}: {BROWSER_REQUIRED_MSG}")
             return None
+
         try:
             cmd = [YTDLP_PATH, "--get-url", "--no-playlist"]
             user_agent = get_user_agent()
@@ -707,6 +757,29 @@ class SharedPreviewWorker(QThread):
         return None
 
     def _capture(self, page_url: str):
+        if "stripchat.com" in (page_url or "").lower():
+            print(f"[Debug] SharedPreviewWorker Stripchat capture: {page_url}")
+            frame_data = _get_stripchat_preview_frame(page_url)
+            if frame_data is None:
+                print(f"[Debug] Stripchat preview frame was empty for {page_url}")
+                return
+            image_bytes, width, height = frame_data
+            if not image_bytes:
+                print(f"[Debug] Stripchat preview frame was empty for {page_url}")
+                return
+            try:
+                img = QImage(image_bytes, width, height, width * 3, QImage.Format_RGB888)
+                px = QPixmap.fromImage(img)
+                if not px.isNull():
+                    self._pixmap_cache[page_url] = px
+                    self.preview_updated.emit(page_url, px)
+                    print(f"[Debug] Stripchat preview updated pixmap for {page_url}")
+                    return
+                print(f"[Debug] Stripchat preview produced null pixmap for {page_url}")
+            except Exception as e:
+                print(f"[Debug] Stripchat preview QImage conversion failed for {page_url}: {e!r}")
+            return
+
         stream_url = self._get_stream_url(page_url)
         if not stream_url:
             return
@@ -734,15 +807,21 @@ class SharedPreviewWorker(QThread):
 
         kwargs = {}
         if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+            kwargs["startupinfo"] = startupinfo
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
         try:
+            print(f"[Debug] ffmpeg preview command for {page_url}: {' '.join(cmd)}")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, **kwargs)
             with self._lock:
                 self._ffmpeg_processes.append(proc)
             try:
-                stdout, _ = proc.communicate(timeout=30)
+                stdout, stderr = proc.communicate(timeout=30)
+                print(f"[Debug] ffmpeg preview stderr for {page_url}: {stderr.decode('utf-8', 'replace')[:1000]}")
                 expected = W * H * 3
                 if len(stdout) >= expected:
                     img = QImage(stdout[:expected], W, H, W * 3, QImage.Format_RGB888)
@@ -750,7 +829,13 @@ class SharedPreviewWorker(QThread):
                     if not px.isNull():
                         self._pixmap_cache[page_url] = px
                         self.preview_updated.emit(page_url, px)
+                        print(f"[Debug] ffmpeg preview updated pixmap for {page_url}")
+                    else:
+                        print(f"[Debug] ffmpeg preview produced null pixmap for {page_url}")
+                else:
+                    print(f"[Debug] ffmpeg preview produced {len(stdout)} bytes for {page_url}, expected >= {expected}")
             except subprocess.TimeoutExpired:
+                print(f"[Debug] ffmpeg preview timed out for {page_url}")
                 proc.kill(); proc.wait()
                 self._stream_url_cache.pop(page_url, None)
             finally:
@@ -853,6 +938,70 @@ class DownloadWorker(QThread):
         self._last_detected_format: Optional[tuple[str, int]] = None
         os.makedirs(self.output_path, exist_ok=True)
 
+    def _emit_stripchat_progress(self, progress):
+        """Bridge StripchatDownloader progress events into the existing UI signals."""
+        if getattr(progress, "total_segments", None):
+            pct = int((progress.segment_count / progress.total_segments) * 100)
+            self.progress_signal.emit(self.username, max(0, min(100, pct)))
+
+    def _run_stripchat_download(self) -> bool:
+        """Use the native Stripchat downloader for Stripchat URLs."""
+        if "stripchat.com" not in (self.stream_url or "").lower() or StripchatDownloader is None or DownloadRequest is None:
+            return False
+
+        try:
+            info = get_stream_info(self.stream_url, target_height=1080)
+            if info:
+                self.resolution_signal.emit(
+                    self.stream_url,
+                    f"{info.width}x{info.height}",
+                    int(round(info.fps or MAX_DOWNLOAD_FPS)),
+                )
+        except Exception as exc:
+            print(f"[Debug] Stripchat resolution probe failed for {self.stream_url}: {exc!r}")
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
+        output_file = os.path.join(self.output_path, f"{self.username} {timestamp}.mp4")
+        request = DownloadRequest(
+            stream_url=self.stream_url,
+            output_file=output_file,
+            target_height=1080,
+            user_agent=USER_AGENT or None,
+            remux_on_finish=True,
+        )
+
+        self.is_running = True
+        self.log_signal.emit(self.username, "🧩 Using Stripchat native downloader…")
+
+        # Use a flag to track if we should stop
+        self._stripchat_stop = False
+
+        # Create the downloader
+        downloader = StripchatDownloader(request)
+        downloader.log_signal.connect(lambda msg: self.log_signal.emit(self.username, msg))
+        downloader.progress_signal.connect(self._emit_stripchat_progress)
+        downloader.error_signal.connect(lambda msg: self.log_signal.emit(self.username, f"❌ Stripchat: {msg}"))
+        downloader.finished_signal.connect(lambda path: self.finished_signal.emit(self.stream_url))
+
+        # Start the thread
+        downloader.start()
+
+        # Keep waiting for the native Stripchat downloader to finish its own
+        # remux/cleanup path after a stop request. If we exit early, the partial
+        # .temp capture is left behind without remuxing.
+        while downloader.isRunning():
+            if self.manual_stop or self._stripchat_stop:
+                downloader.stop()
+            time.sleep(0.1)
+
+        if downloader.isRunning():
+            downloader.stop()
+            downloader.wait(15000)
+
+        self._stripchat_stop = False
+        self.is_running = False
+        return True
+
     def _probe_resolution(self) -> tuple[str, int]:
         """Ask yt-dlp for the selected format's resolution + fps before
         starting the download. This is a best-effort guess from metadata
@@ -910,6 +1059,11 @@ class DownloadWorker(QThread):
         if self.is_running:
             return
         try:
+            if "stripchat.com" in (self.stream_url or "").lower():
+                handled = self._run_stripchat_download()
+                if handled:
+                    return
+
             if _missing_browser_for_site(self.stream_url):
                 raise RuntimeError(BROWSER_REQUIRED_MSG)
 
@@ -1067,13 +1221,20 @@ class DownloadWorker(QThread):
         if not self.is_running:
             return
 
+        self.manual_stop = True
+
+        # Signal Stripchat downloader to stop. Do not set self.is_running to
+        # False immediately here: the Stripchat native thread needs to finish its
+        # final remux from the partial capture, and exiting the worker too early
+        # would leave the .temp file behind.
+        self._stripchat_stop = True
+
+        # Handle yt-dlp process if it exists
         proc = self.process
         if not proc:
             return
 
         self.log_signal.emit(self.username, "⏹ Stopping download…")
-        self.manual_stop = True
-        self.is_running = False
 
         try:
             parent = psutil.Process(proc.pid)
@@ -1186,6 +1347,53 @@ class StreamChecker(QThread):
 
     def _check(self, url: str) -> tuple[StreamStatus, str]:
         self._rate_limiter.wait_if_needed()
+
+        if "stripchat.com" in (url or "").lower():
+            try:
+                from sites.stripchat import extract_stripchat_data
+                username = url.rstrip("/").split("/")[-1]
+                data = extract_stripchat_data(username)
+
+                status = data.get("status", "")
+
+                # Map Stripchat status to our StreamStatus enum
+                status_map = {
+                    "public": (StreamStatus.ONLINE, "🟢 LIVE"),
+                    "groupShow": (StreamStatus.PRIVATE, "🎫 Ticket show"),
+                    "private": (StreamStatus.PRIVATE, "🔒 Private show"),
+                    "p2p": (StreamStatus.PRIVATE, "💰 P2P show"),
+                    "away": (StreamStatus.AWAY, "🌙 Away"),
+                    "off": (StreamStatus.OFFLINE, "💤 Offline"),
+                }
+
+                if status in status_map:
+                    return status_map[status]
+                else:
+                    # Fallback: use the original method
+                    info = _get_stripchat_stream_info(url)
+                    if info is None:
+                        return StreamStatus.OFFLINE, "💤 Offline"
+                    return (
+                        (StreamStatus.ONLINE, "🟢 LIVE") if info.is_live else (StreamStatus.OFFLINE, "💤 Offline")
+                    )
+
+            except Exception as exc:
+                message = str(exc).lower()
+                if "ticket" in message or "group" in message:
+                    return StreamStatus.PRIVATE, "🎫 Ticket show"
+                if "private" in message:
+                    return StreamStatus.PRIVATE, "🔒 Private show"
+                if "p2p" in message:
+                    return StreamStatus.PRIVATE, "💰 P2P show"
+                if "away" in message:
+                    return StreamStatus.AWAY, "🌙 Away"
+                if "not currently live" in message or "off" in message:
+                    return StreamStatus.OFFLINE, "💤 Offline"
+                print(f"[Debug] Stripchat live check failed for {url}: {exc!r}")
+                return StreamStatus.ERROR, "❌ Stripchat check failed"
+
+        # ... rest of the method for other sites
+
         if _missing_browser_for_site(url):
             return StreamStatus.ERROR, f"⚠ {BROWSER_REQUIRED_MSG}"
         try:
@@ -2129,11 +2337,11 @@ class SettingsDialog(QDialog):
         # Remove the '%' sign and convert to int
         percent = int(percent_text.replace("%", ""))
         DOWNLOAD_BANDWIDTH_PERCENT = percent
-        
+
         # Recalculate the safe limit based on the new percentage
         if DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S > 0:
             self._recalculate_safe_limit()
-        
+
         self.settings_changed.emit()
 
     def _recalculate_safe_limit(self):
@@ -2210,6 +2418,14 @@ class StreamDownloaderGUI(QMainWindow):
         self._load_saved_streams()
         self._update_download_info()
         self._update_browser_unset_banner()
+
+        if FFMPEG_HAS_NATIVE_H264_DECODER:
+            self._log_msg("FFmpeg H.264 decoder: available", "#7ae8a6")
+        else:
+            self._log_msg(
+                "FFmpeg H.264 decoder: unavailable — Stripchat previews disabled",
+                "#ffb74d",
+            )
 
         QApplication.instance().aboutToQuit.connect(self._shutdown_workers)
 
@@ -2733,8 +2949,8 @@ class StreamDownloaderGUI(QMainWindow):
         worker = self.download_workers.get(url)
         if worker:
             worker.stop()
-            worker.wait(3000)
-            self._cleanup_download(url)
+            if not worker.isRunning():
+                self._cleanup_download(url)
 
     def _stop_all(self):
         count = len(self.download_workers)
@@ -2996,7 +3212,7 @@ class StreamDownloaderGUI(QMainWindow):
                 worker.wait(2000)
             worker.deleteLater()
             self.download_workers.pop(url, None)
-        
+
         timer = self.download_timers.get(url)
         if timer:
             timer.stop_timer()
