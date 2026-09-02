@@ -1,6 +1,6 @@
 # Stream Monitor
 
-A desktop GUI for monitoring and auto-recording live streams from **Chaturbate, Camsoda, and BongaCams** on Windows, macOS, and Linux — tracks multiple models in parallel, shows live thumbnail previews, and downloads automatically via `yt-dlp` and `ffmpeg` when someone goes live.
+A desktop GUI for monitoring and auto-recording live streams from **Chaturbate, Camsoda, BongaCams and Stripchat** on Windows, macOS, and Linux — tracks multiple models in parallel, shows live thumbnail previews, and downloads automatically via `yt-dlp` and `ffmpeg` when someone goes live.
 
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -16,7 +16,7 @@ A desktop GUI for monitoring and auto-recording live streams from **Chaturbate, 
 ## ✨ Features
 
 - Live stream status checking via `yt-dlp`, with adaptive polling — checks every 90s while a stream is live, backs off up to 300s for streams that stay offline, so idle rooms don't get hammered
-- Multi-site support for Chaturbate, Camsoda, and BongaCams, with per-site `yt-dlp` overrides where required
+- Multi-site support for Chaturbate, Camsoda, BongaCams and Stripchat, with per-site `yt-dlp` overrides where required
 - Real-time thumbnail previews, captured via a single-frame `ffmpeg` grab per stream
 - Automatic recording via `yt-dlp` the moment a tracked stream goes live, with a 5-level format-selector fallback (exact resolution+FPS down to just "best available")
 - Settings dialog for download output, cookies (read live from a real browser's cookie database), User-Agent, and video quality — every field persists across restarts
@@ -191,11 +191,14 @@ Downloads/
 
 **Previews never show up** — preview capture needs `ffmpeg` specifically (separate from `yt-dlp`, which handles the actual downloads). Confirm `ffmpeg -version` works from the same terminal/environment the app is running in.
 
+**Startup says "FFmpeg H.264 decoder: unavailable — Stripchat previews disabled"** — your FFmpeg build doesn't include a usable native H.264 decoder. This is most common with some Linux distributions or minimal FFmpeg builds. Install a full FFmpeg build from your distribution's supported multimedia repository, then restart the app. On Fedora, for example, the RPM Fusion FFmpeg packages provide the required decoder support. This only affects Stripchat previews; downloads are unaffected.
+
 **A popup says Chrome/Chromium cookie access failed** — the app checks this automatically for Chrome/Edge/Brave/Opera on Windows and warns you if it fails; it's a known Chrome-on-Windows limitation, not a bug in this app, and closing the browser doesn't reliably fix it. Either export your cookies (see [Exporting cookies](#-exporting-cookies) above) and select the file in Settings' **Cookies file** row, or switch to a Firefox-based browser instead, which isn't affected.
 
 **App window doesn't seem to open** — A successful launch prints nothing to the terminal at all (this is normal Qt behavior), so check for a new window rather than assuming it crashed. If it genuinely doesn't start, run it from a terminal to see the actual traceback.
 
 *Windows-specific*: If double-clicking stream_manager.py does nothing, you can launch it directly using the project's own Python interpreter:
+
 1. Right-click `stream_manager.py` → **Open with** → **Choose another app** → **Choose an app on your PC**
 2. Navigate to your `stream-monitor` folder → `Stream_Venv` → `Scripts` → select **`pythonw.exe`**
 3. If desired, check **"Always use this app to open .py files"** to make future double-clicks work automatically.
