@@ -47,10 +47,12 @@ import tempfile
 import sys
 import functools
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 from datetime import datetime
 from PySide6.QtCore import QThread, Signal
+from .base import SiteStatus
+from .registry import hostname_from_url
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -202,6 +204,15 @@ class DownloadRequest:
     target_height: int = 1080
     remux_on_finish: bool = True
     user_agent: Optional[str] = None
+    ffmpeg_path: str = "ffmpeg"
+
+
+@dataclass(frozen=True)
+class StripchatDownloadResult:
+    """Terminal result returned by the native download session."""
+
+    status: str
+    message: str = ""
 
 @dataclass
 class DownloadProgress:
@@ -420,7 +431,7 @@ class StripchatDownloader(QThread):
                 ))
 
                 cmd = [
-                    "ffmpeg",
+                    self.request.ffmpeg_path,
                     "-hide_banner",
                     "-loglevel", "error",
                     "-y",
@@ -856,24 +867,144 @@ def get_preview_frame(stream_url: str, target_height: int = 720, user_agent: Opt
         print(f"[Debug] Failed to get preview frame: {e!r}")
         return None
 
+
+class StripchatSiteAdapter:
+    """Application-facing boundary for Stripchat-specific operations."""
+
+    key = "stripchat.com"
+    display_name = "Stripchat"
+
+    @staticmethod
+    def matches(url: str) -> bool:
+        hostname = hostname_from_url(url)
+        return hostname == "stripchat.com" or hostname.endswith(".stripchat.com")
+
+    def check(self, url: str, user_agent: Optional[str] = None) -> SiteStatus:
+        username = url.rstrip("/").split("/")[-1]
+        data = extract_stripchat_data(username, user_agent=user_agent)
+        status = data.get("status", STREAM_STATUS_OFF)
+        messages = {
+            STREAM_STATUS_PUBLIC: ("online", "🟢 LIVE"),
+            STREAM_STATUS_GROUP_SHOW: ("private", "🎫 Ticket show"),
+            STREAM_STATUS_PRIVATE: ("private", "🔒 Private show"),
+            STREAM_STATUS_P2P: ("private", "💰 P2P show"),
+            STREAM_STATUS_AWAY: ("away", "🌙 Away"),
+            STREAM_STATUS_OFF: ("offline", "💤 Offline"),
+        }
+        if status in messages:
+            value, message = messages[status]
+            return SiteStatus(value, message)
+
+        info = get_stream_info(url, user_agent=user_agent)
+        return SiteStatus("online" if info and info.is_live else "offline", "🟢 LIVE" if info and info.is_live else "💤 Offline")
+
+    @staticmethod
+    def preview(url: str, user_agent: Optional[str] = None) -> Optional[PreviewFrame]:
+        return get_preview_frame(url, target_height=720, user_agent=user_agent)
+
+    @classmethod
+    def preview_data(cls, url: str, user_agent: Optional[str] = None) -> Optional[tuple[bytes, int, int]]:
+        frame = cls.preview(url, user_agent=user_agent)
+        return (frame.image, frame.width, frame.height) if frame else None
+
+    @staticmethod
+    def supports_download() -> bool:
+        return True
+
+    def download(
+        self,
+        stream_url: str,
+        username: str,
+        output_directory: str,
+        target_height: int,
+        user_agent: Optional[str],
+        ffmpeg_path: str = "ffmpeg",
+        on_log: Optional[Callable[[str], None]] = None,
+        on_progress: Optional[Callable[[int], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        on_resolution: Optional[Callable[[str, int], None]] = None,
+    ) -> StripchatDownloadResult:
+        """Run one native download and wait for its complete lifecycle."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
+        output_file = os.path.join(output_directory, f"{username} {timestamp}.mp4")
+        request = DownloadRequest(
+            stream_url=stream_url,
+            output_file=output_file,
+            target_height=target_height,
+            user_agent=user_agent or None,
+            ffmpeg_path=ffmpeg_path,
+            remux_on_finish=True,
+        )
+
+        try:
+            info = get_stream_info(
+                stream_url,
+                target_height=target_height,
+                user_agent=user_agent or None,
+            )
+            if info and on_resolution:
+                on_resolution(f"{info.width}x{info.height}", int(round(info.fps or 0)))
+        except Exception as exc:
+            if on_log:
+                on_log(f"Resolution probe failed: {exc}")
+
+        outcome = {"status": "running", "message": ""}
+
+        def handle_error(message: str):
+            outcome["status"] = "error"
+            outcome["message"] = message
+            if on_error:
+                on_error(message)
+
+        def handle_progress(progress: DownloadProgress):
+            if on_progress and progress.total_segments:
+                percent = int((progress.segment_count / progress.total_segments) * 100)
+                on_progress(max(0, min(100, percent)))
+
+        downloader = StripchatDownloader(request)
+        if on_log:
+            downloader.log_signal.connect(on_log)
+        if on_progress:
+            downloader.progress_signal.connect(handle_progress)
+        downloader.error_signal.connect(handle_error)
+
+        if on_log:
+            on_log("Using Stripchat native downloader...")
+        downloader.start()
+
+        while downloader.isRunning():
+            if should_stop and should_stop():
+                downloader.stop()
+            time.sleep(0.1)
+
+        downloader.wait(15000)
+        if outcome["status"] == "error":
+            return StripchatDownloadResult("error", outcome["message"])
+        if should_stop and should_stop():
+            return StripchatDownloadResult("stopped", "Stop requested")
+        if outcome["status"] == "running":
+            outcome["status"] = "success"
+        else:
+            outcome["status"] = "error"
+            outcome["message"] = "Native downloader ended without a terminal result"
+
+        return StripchatDownloadResult(outcome["status"], outcome["message"])
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  COMMAND-LINE TESTING
 # ──────────────────────────────────────────────────────────────────────────────
 #  This section is for development and debugging only.
+
+# usage: python -m sites.stripchat https://stripchat.com/username
+# from main directory. It will print stream info and optionally save debug data.
 
 if __name__ == "__main__":
     import sys
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Stripchat integration testing tool",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s https://stripchat.com/alicekek              # Show stream info
-  %(prog)s https://stripchat.com/alicekek 720          # Show info for 720p
-  %(prog)s https://stripchat.com/alicekek --debug      # Save debug data
-        """
+    description="Stripchat integration testing and debug tool"
     )
 
     parser.add_argument(
@@ -908,7 +1039,7 @@ Examples:
 
     try:
         # Default: Show stream info
-        print(f"🔍 Getting stream info for: {args.url}")
+        print(f"Getting stream info for: {args.url}")
         print("=" * 60)
 
         info = get_stream_info(args.url, target_height=args.height)
@@ -917,8 +1048,8 @@ Examples:
         print(f"Username:       {info.username}")
         print(f"Model ID:       {info.model_id}")
         print(f"Status:         {info.status}")
-        print(f"Live:           {'✅ Yes' if info.is_live else '❌ No'}")
-        print(f"Accessible:     {'✅ Yes' if info.is_accessible else '❌ No'}")
+        print(f"Live:           {'Yes' if info.is_live else 'No'}")
+        print(f"Accessible:     {'Yes' if info.is_accessible else 'No'}")
 
         # Add explanation for inaccessible streams
         if not info.is_accessible:

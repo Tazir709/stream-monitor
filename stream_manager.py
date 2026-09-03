@@ -62,21 +62,28 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QDir, QUrl
 from PySide6.QtGui import QImage, QPixmap, QColor, QDesktopServices
+from sites import (
+    check_args_for_url,
+    check_status_for_url,
+    display_name_for_url,
+    download_args_for_url,
+    extract_username,
+    ffmpeg_args_for_url,
+    referer_for_url,
+    requires_authentication,
+    SiteCheckContext,
+)
 
 try:
     from sites.stripchat import (
-        get_stream_info,
-        get_preview_frame,
-        StripchatDownloader,
-        DownloadRequest,
+        StripchatSiteAdapter,
         FFMPEG_HAS_NATIVE_H264_DECODER,
     )
 except ImportError:  # pragma: no cover - used when the helper module is unavailable
-    get_stream_info = None
-    get_preview_frame = None
-    StripchatDownloader = None
-    DownloadRequest = None
+    StripchatSiteAdapter = None
     FFMPEG_HAS_NATIVE_H264_DECODER = False
+
+STRIPCHAT_ADAPTER = StripchatSiteAdapter() if StripchatSiteAdapter else None
 
 
 # ─────────────────────────────────────────────
@@ -297,97 +304,12 @@ def get_cookie_args() -> list[str]:
 
 
 # ─────────────────────────────────────────────
-#  Per-site yt-dlp overrides
-# ─────────────────────────────────────────────
-#
-# Some sites need extra yt-dlp flags to work at all. Keyed by a substring
-# that's matched (case-insensitively) against the stream URL. Add new
-# sites here rather than sprinkling `if "sitename" in url` checks through
-# the command-building code.
-#
-# "impersonate": True means pass `--impersonate {browser_type}`, reusing
-#   whatever browser is already configured in Settings (the real_browser
-#   part of BROWSER, e.g. "firefox" out of "firefox:default-release").
-#   Set it to a specific string instead (e.g. "chrome") to force a
-#   particular impersonate target regardless of the configured browser.
-#   Used for both the check worker and the download worker.
-# "extra_args": a flat list of additional yt-dlp CLI args appended as-is,
-#   used by the download worker only (the check/probe calls stay generic).
-# "ffmpeg_extra_args": a flat list of extra ffmpeg args for the *preview*
-#   worker's capture command, inserted right after the input (-i) options,
-#   e.g. for HLS containers ffmpeg needs extra flags to demux
-#   (fmp4-in-.ts-style segments, non-standard extensions, etc).
-# "referer": the Referer header to send on the preview worker's ffmpeg
-#   capture request. Some sites 403 the HLS segments without it.
-SITE_OVERRIDES: dict[str, dict] = {
-    "chaturbate.com": {
-        "referer": "https://chaturbate.com/",
-    },
-    "camsoda.com": {
-        # Camsoda uses .hls.fmp4 segments; ffmpeg needs -allowed_extensions ALL
-        # -extension_picky 0 to demux them, and returns 403 without --impersonate.
-        "impersonate": True,
-        "extra_args": [
-            "--downloader-args", "ffmpeg_i:-extension_picky 0",
-        ],
-        "ffmpeg_extra_args": ["-allowed_extensions", "ALL", "-extension_picky", "0"],
-        "referer": "https://www.camsoda.com/",
-    },
-    "bongacams.com": {
-        # Regular .ts HLS segments; only --impersonate needed, for live checks.
-        "impersonate": True,
-    },
-
-    # Stripchat.com is handled by the dedicated helper module (stripchat.py) instead of yt-dlp,
-    # so no override is needed here.
-
-    # "othersite.com": {
-    #     "impersonate": "chrome",  # force a specific target regardless of Settings
-    #     "extra_args": ["--some-flag", "value"],
-    #     "ffmpeg_extra_args": ["-some-ffmpeg-flag", "value"],
-    #     "referer": "https://www.othersite.com/",
-    # },
-}
-
-
-def _site_override(url: str) -> dict:
-    """Return the SITE_OVERRIDES entry matching `url` (by substring, case
-    insensitive), or {} if no site matches."""
-    host = (url or "").lower()
-    for site_key, cfg in SITE_OVERRIDES.items():
-        if site_key in host:
-            return cfg
-    return {}
-
-
 BROWSER_REQUIRED_MSG = "No browser configured in Settings — required for this site's cookies/impersonate"
 
 
-def _missing_browser_for_site(url: str) -> bool:
-    # Only True forced-impersonate (reuse whatever's configured in Settings)
-    # actually needs BROWSER set -- a specific string like "chrome" forces
-    # that target regardless of BROWSER, per the SITE_OVERRIDES docstring.
-    return _site_override(url).get("impersonate") is True and not BROWSER
-
-
-def _impersonate_args(cfg: dict) -> list[str]:
-    impersonate = cfg.get("impersonate")
-    if not impersonate:
-        return []
-    if impersonate is True:
-        browser_type = BROWSER.split(":", 1)[0].strip()
-    else:
-        browser_type = str(impersonate)
-    return ["--impersonate", browser_type] if browser_type else []
-
-
 def get_site_args(url: str) -> list[str]:
-    """Return extra yt-dlp CLI args (impersonate + extra_args) for whichever
-    site `url` belongs to, based on SITE_OVERRIDES. Used by the download
-    worker. Safe to call for URLs with no override configured (returns an
-    empty list)."""
-    cfg = _site_override(url)
-    return _impersonate_args(cfg) + list(cfg.get("extra_args", []))
+    """Return site-specific yt-dlp download arguments."""
+    return download_args_for_url(url, BROWSER)
 
 
 def get_site_check_args(url: str) -> list[str]:
@@ -395,19 +317,19 @@ def get_site_check_args(url: str) -> list[str]:
     calls — currently just --impersonate where configured. Kept separate
     from get_site_args() since checks shouldn't need the download-only
     flags (e.g. --downloader-args)."""
-    return _impersonate_args(_site_override(url))
+    return check_args_for_url(url, BROWSER)
 
 
 def get_site_referer(url: str) -> str:
     """Return the Referer header to use for the preview worker's ffmpeg
     capture, or "" if none is configured for this site."""
-    return _site_override(url).get("referer", "")
+    return referer_for_url(url)
 
 
 def get_site_ffmpeg_args(url: str) -> list[str]:
     """Return extra ffmpeg args for the preview worker's capture command,
     or [] if none is configured for this site."""
-    return list(_site_override(url).get("ffmpeg_extra_args", []))
+    return ffmpeg_args_for_url(url)
 
 
 def _find_tool(name: str) -> str:
@@ -500,63 +422,9 @@ class RateLimiter:
             self._last = time.time()
 
 
-def extract_username(url: str) -> str:
-    url = url.rstrip("/")
-    match = re.search(r'(?:https?://)?[^/]+/([^/?#]+)', url)
-    return match.group(1) if match else url
-
-
-# Friendly display names for known sites
-SITE_DISPLAY_NAMES: dict[str, str] = {
-    "chaturbate.com": "Chaturbate",
-    "camsoda.com": "Camsoda",
-    "bongacams.com": "BongaCams",
-    "stripchat.com": "Stripchat",
-}
-
-
 def extract_site(url: str) -> str:
-    """Return a short, human-readable site name from a stream URL, e.g.
-    "https://chaturbate.com/someuser/" -> "Chaturbate". Falls back to the
-    bare registrable domain label (e.g. "example" for example.com/tv) for
-    sites with no entry in SITE_DISPLAY_NAMES."""
-    host = (url or "").lower()
-    for site_key, display_name in SITE_DISPLAY_NAMES.items():
-        if site_key in host:
-            return display_name
-
-    match = re.search(r'(?:https?://)?(?:www\.)?([^/]+)', url)
-    domain = match.group(1) if match else ""
-    label = domain.split(".")[0] if domain else ""
-    return label.capitalize() if label else "Unknown"
-
-
-def _get_stripchat_stream_info(url: str):
-    """Resolve Stripchat stream metadata using the dedicated helper."""
-    if not url or "stripchat.com" not in url.lower() or get_stream_info is None:
-        return None
-    try:
-        return get_stream_info(url, user_agent=get_user_agent())
-    except Exception as e:
-        print(f"[Debug] Stripchat stream info failed for {url}: {e!r}")
-        return None
-
-
-def _get_stripchat_preview_frame(url: str) -> Optional[tuple[bytes, int, int]]:
-    """Return decoded RGB preview bytes from Stripchat's preview-frame helper."""
-    if not url or "stripchat.com" not in url.lower() or get_preview_frame is None:
-        print(f"[Debug] Stripchat preview skipped: url={url!r}, helper_available={get_preview_frame is not None}")
-        return None
-    try:
-        frame = get_preview_frame(url, target_height=720, user_agent=get_user_agent())
-        if not frame:
-            print(f"[Debug] Stripchat preview returned None for: {url}")
-            return None
-            
-        return frame.image, frame.width, frame.height
-    except Exception as e:
-        print(f"[Debug] Stripchat preview failed for {url}: {e!r}")
-        return None
+    """Return a short, human-readable site name from a stream URL."""
+    return display_name_for_url(url)
 
 
 def log_exception(prefix: str) -> None:
@@ -707,9 +575,9 @@ class SharedPreviewWorker(QThread):
             if time.time() < expiry:
                 return stream_url
 
-        if "stripchat.com" in (page_url or "").lower():
+        if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(page_url):
             try:
-                frame_data = _get_stripchat_preview_frame(page_url)
+                frame_data = STRIPCHAT_ADAPTER.preview_data(page_url, user_agent=get_user_agent())
                 if frame_data:
                     self._stream_url_cache[page_url] = ("stripchat_preview", time.time() + self.HLS_CACHE_LIFETIME)
                     self._stripchat_preview_cache[page_url] = frame_data
@@ -719,7 +587,7 @@ class SharedPreviewWorker(QThread):
                 print(f"[Debug] Stripchat preview failed: {e!r}")
                 return None
 
-        if _missing_browser_for_site(page_url):
+        if requires_authentication(page_url, BROWSER):
             print(f"[Debug] PreviewWorker _get_stream_url skipped for {page_url}: {BROWSER_REQUIRED_MSG}")
             return None
 
@@ -750,8 +618,8 @@ class SharedPreviewWorker(QThread):
         return None
 
     def _capture(self, page_url: str):
-        if "stripchat.com" in (page_url or "").lower():
-            frame_data = _get_stripchat_preview_frame(page_url)
+        if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(page_url):
+            frame_data = STRIPCHAT_ADAPTER.preview_data(page_url, user_agent=get_user_agent())
             if frame_data is None:
                 print(f"[Debug] Stripchat preview frame was empty for {page_url}")
                 return
@@ -928,64 +796,29 @@ class DownloadWorker(QThread):
         self._last_detected_format: Optional[tuple[str, int]] = None
         os.makedirs(self.output_path, exist_ok=True)
 
-    def _emit_stripchat_progress(self, progress):
-        """Bridge StripchatDownloader progress events into the existing UI signals."""
-        if getattr(progress, "total_segments", None):
-            pct = int((progress.segment_count / progress.total_segments) * 100)
-            self.progress_signal.emit(self.username, max(0, min(100, pct)))
-
     def _run_stripchat_download(self) -> bool:
-        """Use the native Stripchat downloader for Stripchat URLs."""
-        if "stripchat.com" not in (self.stream_url or "").lower() or StripchatDownloader is None or DownloadRequest is None:
+        """Run the native Stripchat session through its site adapter."""
+        if not STRIPCHAT_ADAPTER or not STRIPCHAT_ADAPTER.matches(self.stream_url):
             return False
 
-        try:
-            info = get_stream_info(self.stream_url, target_height=1080)
-            if info:
-                self.resolution_signal.emit(
-                    self.stream_url,
-                    f"{info.width}x{info.height}",
-                    int(round(info.fps or MAX_DOWNLOAD_FPS)),
-                )
-        except Exception as exc:
-            print(f"[Debug] Stripchat resolution probe failed for {self.stream_url}: {exc!r}")
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
-        output_file = os.path.join(self.output_path, f"{self.username} {timestamp}.mp4")
-        request = DownloadRequest(
-            stream_url=self.stream_url,
-            output_file=output_file,
-            target_height=1080,
-            user_agent=USER_AGENT or None,
-            remux_on_finish=True,
-        )
-
         self.is_running = True
-        self.log_signal.emit(self.username, "🧩 Using Stripchat native downloader…")
-
         self._stripchat_stop = False
 
-        # Create the downloader
-        downloader = StripchatDownloader(request)
-        downloader.log_signal.connect(lambda msg: self.log_signal.emit(self.username, msg))
-        downloader.progress_signal.connect(self._emit_stripchat_progress)
-        downloader.error_signal.connect(lambda msg: self.log_signal.emit(self.username, f"❌ Stripchat: {msg}"))
-        downloader.finished_signal.connect(lambda path: self.finished_signal.emit(self.stream_url))
-
-        # Start the thread
-        downloader.start()
-
-        # Keep waiting for the native Stripchat downloader to finish its own
-        # remux/cleanup path after a stop request. If we exit early, the partial
-        # .temp capture is left behind without remuxing.
-        while downloader.isRunning():
-            if self.manual_stop or self._stripchat_stop:
-                downloader.stop()
-            time.sleep(0.1)
-
-        if downloader.isRunning():
-            downloader.stop()
-            downloader.wait(15000)
+        result = STRIPCHAT_ADAPTER.download(
+            stream_url=self.stream_url,
+            username=self.username,
+            output_directory=self.output_path,
+            target_height=int(MAX_DOWNLOAD_RESOLUTION.split("x", 1)[1]),
+            user_agent=USER_AGENT or None,
+            ffmpeg_path=FFMPEG_PATH,
+            on_log=lambda message: self.log_signal.emit(self.username, message),
+            on_progress=lambda percent: self.progress_signal.emit(self.username, percent),
+            on_error=lambda message: self.log_signal.emit(self.username, f"❌ Stripchat: {message}"),
+            should_stop=lambda: self.manual_stop or self._stripchat_stop,
+            on_resolution=lambda resolution, fps: self.resolution_signal.emit(
+                self.stream_url, resolution, fps or MAX_DOWNLOAD_FPS
+            ),
+        )
 
         self._stripchat_stop = False
         self.is_running = False
@@ -1048,12 +881,12 @@ class DownloadWorker(QThread):
         if self.is_running:
             return
         try:
-            if "stripchat.com" in (self.stream_url or "").lower():
+            if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(self.stream_url):
                 handled = self._run_stripchat_download()
                 if handled:
                     return
 
-            if _missing_browser_for_site(self.stream_url):
+            if requires_authentication(self.stream_url, BROWSER):
                 raise RuntimeError(BROWSER_REQUIRED_MSG)
 
             self.log_signal.emit(self.username, "🔍 Probing stream format…")
@@ -1337,34 +1170,16 @@ class StreamChecker(QThread):
     def _check(self, url: str) -> tuple[StreamStatus, str]:
         self._rate_limiter.wait_if_needed()
 
-        if "stripchat.com" in (url or "").lower():
+        if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(url):
             try:
-                from sites.stripchat import extract_stripchat_data
-                username = url.rstrip("/").split("/")[-1]
-                data = extract_stripchat_data(username)
-
-                status = data.get("status", "")
-
-                # Map Stripchat status to our StreamStatus enum
+                result = STRIPCHAT_ADAPTER.check(url, user_agent=get_user_agent())
                 status_map = {
-                    "public": (StreamStatus.ONLINE, "🟢 LIVE"),
-                    "groupShow": (StreamStatus.PRIVATE, "🎫 Ticket show"),
-                    "private": (StreamStatus.PRIVATE, "🔒 Private show"),
-                    "p2p": (StreamStatus.PRIVATE, "💰 P2P show"),
-                    "away": (StreamStatus.AWAY, "🌙 Away"),
-                    "off": (StreamStatus.OFFLINE, "💤 Offline"),
+                    "online": StreamStatus.ONLINE,
+                    "offline": StreamStatus.OFFLINE,
+                    "private": StreamStatus.PRIVATE,
+                    "away": StreamStatus.AWAY,
                 }
-
-                if status in status_map:
-                    return status_map[status]
-                else:
-                    # Fallback: use the original method
-                    info = _get_stripchat_stream_info(url)
-                    if info is None:
-                        return StreamStatus.OFFLINE, "💤 Offline"
-                    return (
-                        (StreamStatus.ONLINE, "🟢 LIVE") if info.is_live else (StreamStatus.OFFLINE, "💤 Offline")
-                    )
+                return status_map.get(result.value, StreamStatus.ERROR), result.message
 
             except Exception as exc:
                 message = str(exc).lower()
@@ -1381,72 +1196,25 @@ class StreamChecker(QThread):
                 print(f"[Debug] Stripchat live check failed for {url}: {exc!r}")
                 return StreamStatus.ERROR, "❌ Stripchat check failed"
 
-        if _missing_browser_for_site(url):
+        if requires_authentication(url, BROWSER):
             return StreamStatus.ERROR, f"⚠ {BROWSER_REQUIRED_MSG}"
-        try:
-            cmd = [self._ytdlp, "--simulate", "--print", "%(live_status)s"]
-            user_agent = get_user_agent()
-            if user_agent:
-                cmd.extend(["--user-agent", user_agent])
-            cmd.extend(get_cookie_args())
-            cmd.extend(get_site_check_args(url))
-            cmd.append(url)
-            r = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                **_subprocess_kwargs(),
-            )
-            stdout = r.stdout.strip().lower()
-            stderr = r.stderr.lower()
 
-            if r.returncode != 0:
-                stderr_lower = stderr.lower()
-                url_lower = url.lower()
-
-                if "camsoda" in url_lower and "no active streams found" in stderr_lower:
-                    return StreamStatus.OFFLINE, "💤 Offline"
-
-                if "currently away" in stderr_lower:
-                    return StreamStatus.AWAY, "🌙 Away"
-
-                if "hidden session" in stderr_lower:
-                    return StreamStatus.PRIVATE, "🔒 Hidden session (private)"
-
-                if "private" in stderr_lower:
-                    return StreamStatus.PRIVATE, "🔒 Private show"
-
-                if "age restricted" in stderr_lower or "age-restricted" in stderr_lower:
-                    return StreamStatus.PRIVATE, "🔒 Age restricted"
-
-                if "offline" in stderr_lower:
-                    return StreamStatus.OFFLINE, "💤 Offline"
-
-                if "video unavailable" in stderr_lower or "not found" in stderr_lower:
-                    return StreamStatus.OFFLINE, "💤 Stream not found"
-
-                error_hint = format_error_message(stderr, stdout)
-                print(f"[Debug] yt-dlp error for {url}: {error_hint}")
-                return StreamStatus.ERROR, error_hint
-
-            if stdout == "is_live":
-                return StreamStatus.ONLINE, "🟢 LIVE"
-            if stdout in ("was_live", "not_live", "post_live"):
-                return StreamStatus.OFFLINE, "💤 Offline"
-            if not stdout:
-                return StreamStatus.ERROR, "❓ Unknown (empty response)"
-
-            return StreamStatus.OFFLINE, f"💤 Unknown ({stdout})"
-
-        except subprocess.TimeoutExpired:
-            return StreamStatus.ERROR, "⏰ Timeout"
-        except subprocess.SubprocessError:
-            return StreamStatus.ERROR, "❌ Process error"
-        except Exception as e:
-            print(f"[Debug] Unexpected error in StreamChecker._check for {url}: {e!r}")
-            traceback.print_exc()
-            return StreamStatus.ERROR, "❌ Error"
+        context = SiteCheckContext(
+            ytdlp_path=self._ytdlp,
+            browser=BROWSER,
+            cookie_args=get_cookie_args(),
+            user_agent=get_user_agent(),
+            subprocess_kwargs=_subprocess_kwargs(),
+            format_error=format_error_message,
+        )
+        result = check_status_for_url(url, context)
+        status_map = {
+            "online": StreamStatus.ONLINE,
+            "offline": StreamStatus.OFFLINE,
+            "private": StreamStatus.PRIVATE,
+            "away": StreamStatus.AWAY,
+        }
+        return status_map.get(result.value, StreamStatus.ERROR), result.message
 
 
 # ─────────────────────────────────────────────
