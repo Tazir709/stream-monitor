@@ -451,6 +451,10 @@ class StripchatDownloader(QThread):
                     self._ffmpeg_process.kill()
                     self._ffmpeg_process.wait(timeout=5)
                     raise
+                if self._ffmpeg_process.returncode != 0:
+                    raise RuntimeError(
+                        f"ffmpeg exited with code {self._ffmpeg_process.returncode}"
+                    )
                 self.log_signal.emit(f"Remuxed to: {output_file}")
 
                 # Clean up temp file
@@ -468,12 +472,19 @@ class StripchatDownloader(QThread):
 
         except Exception as e:
             self.error_signal.emit(str(e))
-            # Clean up temp file on error
+
+            # Keep the raw capture on error instead of deleting it -- a failed
+            # remux (bad ffmpeg path, crash, timeout, non-zero exit) shouldn't
+            # also cost the viewer everything that was actually downloaded.
             if self._temp_file and os.path.exists(self._temp_file):
-                try:
-                    os.unlink(self._temp_file)
-                except:
-                    pass
+                # output_file is always assigned before self._temp_file is set
+                # (see above), so it's guaranteed bound here.
+                self.log_signal.emit(
+                    f"Raw capture preserved at: {self._temp_file} "
+                    "(remux failed -- remux it manually with ffmpeg, e.g. "
+                    f'ffmpeg -i "{self._temp_file}" -c copy -fflags +genpts "{output_file}")'
+                )
+
         finally:
             session.close()
 
