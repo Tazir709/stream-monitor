@@ -474,6 +474,8 @@ class StripchatDownloader(QThread):
                     os.unlink(self._temp_file)
                 except:
                     pass
+        finally:
+            session.close()
 
 # ─────────────────────────────────────────────
 #  Core Functions
