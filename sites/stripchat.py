@@ -472,6 +472,7 @@ class StripchatDownloader(QThread):
 
         except Exception as e:
             self.error_signal.emit(str(e))
+
             # Keep the raw capture on error instead of deleting it -- a failed
             # remux (bad ffmpeg path, crash, timeout, non-zero exit) shouldn't
             # also cost the viewer everything that was actually downloaded.
@@ -483,6 +484,9 @@ class StripchatDownloader(QThread):
                     "(remux failed -- remux it manually with ffmpeg, e.g. "
                     f'ffmpeg -i "{self._temp_file}" -c copy -fflags +genpts "{output_file}")'
                 )
+
+        finally:
+            session.close()
 
 # ─────────────────────────────────────────────
 #  Core Functions
