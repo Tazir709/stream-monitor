@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 from datetime import datetime
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Signal, Qt
 from .base import SiteStatus
 from .registry import hostname_from_url
 
@@ -156,6 +156,7 @@ STREAM_STATUS_GROUP_SHOW = "groupShow"
 STREAM_STATUS_PRIVATE = "private"
 STREAM_STATUS_P2P = "p2p"
 STREAM_STATUS_AWAY = "away"
+STREAM_STATUS_IDLE = "idle"
 STREAM_STATUS_OFF = "off"
 
 # Statuses that are inaccessible for downloading
@@ -524,7 +525,9 @@ def extract_stripchat_data(username: str, user_agent: Optional[str] = None) -> d
     status = model.get("status", STREAM_STATUS_OFF)
 
     # Determine if the stream is actually live
-    is_live = status not in [STREAM_STATUS_OFF, STREAM_STATUS_AWAY]
+    # "idle" means the model is online but not broadcasting, so treat it
+    # the same as offline/away for our purposes.
+    is_live = status not in [STREAM_STATUS_OFF, STREAM_STATUS_AWAY, STREAM_STATUS_IDLE]
 
     # Determine if the stream is accessible for downloading
     # Only "public" streams are accessible
@@ -896,20 +899,34 @@ class StripchatSiteAdapter:
         username = url.rstrip("/").split("/")[-1]
         data = extract_stripchat_data(username, user_agent=user_agent)
         status = data.get("status", STREAM_STATUS_OFF)
+
+        # Empty / None status: the page was scraped mid-transition before
+        # the server filled in the status field. This is a scrape race, not
+        # a real state -- return "unknown" so the manager can skip this
+        # poll cycle instead of misclassifying the stream or killing an
+        # active download.
+        if not status:
+            print(f"[Debug] Empty Stripchat status for {username}")
+            return SiteStatus("unknown", "❓ Unknown")
+
         messages = {
             STREAM_STATUS_PUBLIC: ("online", "🟢 LIVE"),
             STREAM_STATUS_GROUP_SHOW: ("private", "🎫 Ticket show"),
             STREAM_STATUS_PRIVATE: ("private", "🔒 Private show"),
             STREAM_STATUS_P2P: ("private", "💰 P2P show"),
             STREAM_STATUS_AWAY: ("away", "🌙 Away"),
+            STREAM_STATUS_IDLE: ("offline", "💤 Idle"),
             STREAM_STATUS_OFF: ("offline", "💤 Offline"),
         }
         if status in messages:
             value, message = messages[status]
             return SiteStatus(value, message)
 
-        info = get_stream_info(url, user_agent=user_agent)
-        return SiteStatus("online" if info and info.is_live else "offline", "🟢 LIVE" if info and info.is_live else "💤 Offline")
+        # Unknown status string (new value we haven't seen yet). Log it and
+        # treat as "unknown" rather than crashing -- the next poll will
+        # hopefully return something we recognise.
+        print(f"[Debug] Unknown Stripchat status: {status!r}")
+        return SiteStatus("unknown", f"❓ Unknown ({status})")
 
     @staticmethod
     def preview(url: str, user_agent: Optional[str] = None) -> Optional[PreviewFrame]:
@@ -977,10 +994,16 @@ class StripchatSiteAdapter:
 
         downloader = StripchatDownloader(request)
         if on_log:
-            downloader.log_signal.connect(on_log)
+            downloader.log_signal.connect(
+                on_log, Qt.ConnectionType.DirectConnection
+            )
         if on_progress:
-            downloader.progress_signal.connect(handle_progress)
-        downloader.error_signal.connect(handle_error)
+            downloader.progress_signal.connect(
+                handle_progress, Qt.ConnectionType.DirectConnection
+            )
+        downloader.error_signal.connect(
+            handle_error, Qt.ConnectionType.DirectConnection
+        )
 
         if on_log:
             on_log("Using Stripchat native downloader...")

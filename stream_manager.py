@@ -758,6 +758,7 @@ class DownloadWorker(QThread):
     resolution_signal         = Signal(str, str, int)  # (url, "1920x1080", fps)
     auto_download_disabled_signal = Signal(str)      # url
     short_download_signal     = Signal(str, int)   # (url, elapsed_seconds) — emitted when a download ends early
+    remuxing_signal           = Signal(str, bool)  # (url, is_remuxing)
 
     _NOISY_PATTERNS = (
         "error reading http response",
@@ -804,6 +805,15 @@ class DownloadWorker(QThread):
         self.is_running = True
         self._stripchat_stop = False
 
+        # Wrap on_log so we can detect when the adapter starts remuxing
+        # and flip the "remuxing" flag on the GUI row.
+        def wrapped_log(message: str):
+            if "Remuxing with FFmpeg" in message:
+                self.remuxing_signal.emit(self.stream_url, True)
+            elif "Remuxed to:" in message:
+                self.remuxing_signal.emit(self.stream_url, False)
+            self.log_signal.emit(self.username, message)
+
         result = STRIPCHAT_ADAPTER.download(
             stream_url=self.stream_url,
             username=self.username,
@@ -811,7 +821,7 @@ class DownloadWorker(QThread):
             target_height=int(MAX_DOWNLOAD_RESOLUTION.split("x", 1)[1]),
             user_agent=USER_AGENT or None,
             ffmpeg_path=FFMPEG_PATH,
-            on_log=lambda message: self.log_signal.emit(self.username, message),
+            on_log=wrapped_log,
             on_progress=lambda percent: self.progress_signal.emit(self.username, percent),
             on_error=lambda message: self.log_signal.emit(self.username, f"❌ Stripchat: {message}"),
             should_stop=lambda: self.manual_stop or self._stripchat_stop,
@@ -819,6 +829,9 @@ class DownloadWorker(QThread):
                 self.stream_url, resolution, fps or MAX_DOWNLOAD_FPS
             ),
         )
+
+        # Always clear the remuxing flag when we exit, even on error
+        self.remuxing_signal.emit(self.stream_url, False)
 
         self._stripchat_stop = False
         self.is_running = False
@@ -1053,10 +1066,9 @@ class DownloadWorker(QThread):
 
         # Handle yt-dlp process if it exists
         proc = self.process
+        self.log_signal.emit(self.username, "⏹ Stopping download…")
         if not proc:
             return
-
-        self.log_signal.emit(self.username, "⏹ Stopping download…")
 
         try:
             parent = psutil.Process(proc.pid)
@@ -1155,6 +1167,12 @@ class StreamChecker(QThread):
                 if not self._running:
                     break
                 status, message = self._check(url)
+
+                # None means "no result this cycle" (transient unknown) --
+                # don't emit, don't update intervals, just try again next tick.
+                if status is None:
+                    continue
+
                 with self._lock:
                     if url in self._tracked:
                         self._tracked[url] = time.time()
@@ -1173,6 +1191,17 @@ class StreamChecker(QThread):
         if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(url):
             try:
                 result = STRIPCHAT_ADAPTER.check(url, user_agent=get_user_agent())
+
+                # "unknown" means the status couldn't be determined this poll
+                # (empty/missing/unrecognised status string). Return None so
+                # the caller skips this cycle entirely instead of emitting a
+                # status change -- this avoids flickering the GUI to Error
+                # and prevents force-stopping an active download for what is
+                # just a transient scrape race.
+                if result.value == "unknown":
+                    print(f"[Debug] Skipping status update for {url}: {result.message}")
+                    return None, None
+
                 status_map = {
                     "online": StreamStatus.ONLINE,
                     "offline": StreamStatus.OFFLINE,
@@ -2686,6 +2715,7 @@ class StreamDownloaderGUI(QMainWindow):
         worker.resolution_signal.connect(self._on_resolution)
         worker.auto_download_disabled_signal.connect(self._on_auto_download_disabled)
         worker.short_download_signal.connect(self._on_short_download)
+        worker.remuxing_signal.connect(self._on_remuxing)
         self.download_workers[url] = worker
         worker.start()
         item.download_active = True
@@ -2953,13 +2983,43 @@ class StreamDownloaderGUI(QMainWindow):
         if url in self.stream_items:
             self.checker.force_check(url)
 
+    def _on_remuxing(self, url: str, is_remuxing: bool):
+        """Update the GUI to show 'Remuxing…' while Stripchat finishes a
+        partial capture. This is the step that makes Stop All *appear* to
+        hang for a few seconds -- the ffmpeg remux is still running."""
+        item = self.stream_items.get(url)
+        if not item:
+            return
+        if is_remuxing:
+            lbl = self._table.cellWidget(item.row, 3)
+            if lbl:
+                lbl.setText("🎬 Remuxing")
+                lbl.setStyleSheet(
+                    "font-size:11px; color:#9df; background:#1e3a4a;"
+                    "border-radius:4px; padding:2px 6px;"
+                )
+            self._log_msg(f"🎬 Remuxing partial capture: {item.username}", "#5b9bd5")
+        else:
+            lbl = self._table.cellWidget(item.row, 3)
+            if lbl:
+                text, fg, bg = STATUS_STYLE.get(
+                    item.current_status, ("?", "#888", "#1a1a1a")
+                )
+                lbl.setText(text)
+                lbl.setStyleSheet(
+                    f"font-size:11px; color:{fg}; background:{bg};"
+                    "border-radius:4px; padding:2px 6px;"
+                )
+
     # ── Helpers ─────────────────────────────────
 
     def _cleanup_download(self, url: str):
         worker = self.download_workers.get(url)
         if worker:
             worker.stop()
-            if not worker.wait(5000):
+            # Give Stripchat downloads longer to finish their remux
+            timeout = 30000 if (STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(url)) else 5000
+            if not worker.wait(timeout):
                 worker.terminate()
                 worker.wait(2000)
             worker.deleteLater()
