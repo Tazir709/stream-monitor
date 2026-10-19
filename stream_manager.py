@@ -58,7 +58,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QLabel, QPushButton, QLineEdit,
     QTextEdit, QCheckBox, QStatusBar, QMessageBox, QHeaderView,
     QSplitter, QDialog, QFileDialog, QComboBox,
-    QFormLayout, QDialogButtonBox, QSpinBox
+    QFormLayout, QDialogButtonBox, QSpinBox, QTabWidget, QScrollArea
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QDir, QUrl
 from PySide6.QtGui import QImage, QPixmap, QColor, QDesktopServices
@@ -97,6 +97,13 @@ USER_AGENT = ""
 DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the Settings dialog; persisted across sessions.
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
+SPLIT_BY_FILESIZE_ENABLED = False
+SPLIT_FILESIZE_MB = 500
+SPLIT_FILESIZE_MODE = "during"
+_SPLIT_FILESIZE_MODES = {
+    "Split during recording": "during",
+    "Split after recording": "after",
+}
 
 DOWNLOAD_BANDWIDTH_LIMIT_ENABLED = False
 DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S = 0.0
@@ -170,15 +177,80 @@ AUTO_DOWNLOAD_DISABLE_SECONDS = 300
 # Auto-restart automatically re-checked after this many seconds.
 AUTO_REENABLE_COOLDOWN_SECONDS = 0
 
-DOWNLOAD_BITRATE_KBPS = { # Usage calculation, per resolution, per fps bucket.
-    # 60fps entries are ~1.5x their 30fps counterpart (rough real-world
-    # H.264 ratio -- bitrate scales sublinearly with fps, not 2x).
-    "640x360":   {30: 896,  60: 1344},
-    "960x540":   {30: 1696, 60: 2544},
-    "1280x720":  {30: 3096, 60: 4644},
-    "1920x1080": {30: 5128, 60: 7692},
-    "3840x2160": {30: 7192, 60: 10788},
+DOWNLOAD_BITRATE_KBPS = {
+    "640x360":   {30: 935,  60: 1344}, # 60fps untested
+    "960x540":   {30: 1729, 60: 2544}, # 60fps untested
+    "1280x720":  {30: 3115, 60: 4150},   # tested
+    "720x960":  {30: 1670, 60: 2360},
+    "1920x1080": {30: 5128, 60: 7146},   # tested
+    "2560x1440": {30: 7192, 60: 8205}, # 30fps untested
+    "3840x2160": {30: 8550, 60: 10788}, # untested, rare to find
 }
+
+_SEGMENT_SIZE_CHOICES = {
+    "250 MB": 250,
+    "500 MB": 500,
+    "750 MB": 750,
+    "1 GB": 1024,
+    "1.5 GB": 1536,
+    "2 GB": 2048,
+    "2.5 GB": 2560,
+    "3 GB": 3072,
+}
+
+# Safety margins for split-by-size estimation.
+# See calculate_segment_duration_seconds() for details.
+BITRATE_SAFETY_FACTOR = 1.03
+KEYFRAME_SAFETY_FACTOR = 0.96
+BITRATE_SAFETY_FACTOR_SC = 1.12   # was 1.10
+KEYFRAME_SAFETY_FACTOR_SC = 0.96  # unchanged
+STRIPCHAT_60FPS_BITRATE_FACTOR = 1.05
+
+
+def calculate_segment_duration_seconds(
+    size_mb: int,
+    resolution: str,
+    fps: int,
+    bitrate_safety_factor: float = BITRATE_SAFETY_FACTOR,
+    keyframe_safety_factor: float = KEYFRAME_SAFETY_FACTOR,
+) -> int:
+    """Estimate a recording duration from the selected target size and bitrate.
+
+    Applies a bitrate margin to compensate for streams exceeding the table's
+    estimate and a keyframe margin to compensate for segment-boundary cuts.
+    The default margins are used for other sites; Stripchat uses its own
+    larger bitrate margin in calculate_stream_segment_duration_seconds().
+    """
+    bitrate_kbps = get_bitrate_kbps(resolution, fps)
+    if size_mb <= 0 or bitrate_kbps <= 0:
+        return 0
+    adjusted_kbps = bitrate_kbps * bitrate_safety_factor
+    target_bytes = size_mb * 1024 * 1024
+    bytes_per_second = adjusted_kbps * 1000 / 8
+    base_seconds = target_bytes / bytes_per_second
+    adjusted_seconds = base_seconds * keyframe_safety_factor
+    return max(30, int(adjusted_seconds))
+
+
+def calculate_stream_segment_duration_seconds(
+    stream_url: str,
+    size_mb: int,
+    resolution: str,
+    fps: int,
+) -> int:
+    """Estimate a split duration using the safety margins for the stream site."""
+    if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(stream_url):
+        bitrate_safety_factor = BITRATE_SAFETY_FACTOR_SC
+        if fps >= 50:
+            bitrate_safety_factor *= STRIPCHAT_60FPS_BITRATE_FACTOR
+        return calculate_segment_duration_seconds(
+            size_mb,
+            resolution,
+            fps,
+            bitrate_safety_factor,
+            KEYFRAME_SAFETY_FACTOR_SC,
+        )
+    return calculate_segment_duration_seconds(size_mb, resolution, fps)
 
 
 def get_bitrate_kbps(resolution: str, fps: int) -> int:
@@ -373,6 +445,7 @@ def _subprocess_kwargs() -> dict:
 
 YTDLP_PATH = _find_tool("yt-dlp")
 FFMPEG_PATH = _find_tool("ffmpeg")
+FFPROBE_PATH = _find_tool("ffprobe")
 
 
 # ─────────────────────────────────────────────
@@ -782,7 +855,15 @@ class DownloadWorker(QThread):
         r"Video:.*?(\d+)x(\d+)[^,]*,\s*([\d.]+)\s*fps", re.IGNORECASE
     )
 
-    def __init__(self, stream_url: str, username: str, output_path: str = "Downloads"):
+    def __init__(
+        self,
+        stream_url: str,
+        username: str,
+        output_path: str = "Downloads",
+        segment_number: Optional[int] = None,
+        cached_probe: Optional[tuple[str, int]] = None,
+        probe_cache_generation: int = 0,
+    ):
         super().__init__()
         self.setObjectName(f"DownloadWorker-{username}")
         self.stream_url  = stream_url
@@ -791,10 +872,24 @@ class DownloadWorker(QThread):
         self.process: Optional[subprocess.Popen] = None
         self.is_running  = False
         self.manual_stop = False
+        self._run_finished = False
         self._rate_limiter = RateLimiter(2.0)
         self._line_queue: Queue = Queue()
         self._started_at = 0.0
         self._last_detected_format: Optional[tuple[str, int]] = None
+        self.segment_number = segment_number
+        self.split_enabled = SPLIT_BY_FILESIZE_ENABLED
+        self.split_mode = SPLIT_FILESIZE_MODE
+        self._during_split = (
+            self.split_enabled and self.split_mode == "during"
+            and segment_number is not None
+        )
+        self.segment_size_mb = SPLIT_FILESIZE_MB
+        self.cached_probe = cached_probe
+        self.probe_cache_generation = probe_cache_generation
+        self.target_duration_seconds = 0
+        self.automatic_split = False
+        self._expected_output_stem = ""
         os.makedirs(self.output_path, exist_ok=True)
 
     def _run_stripchat_download(self) -> bool:
@@ -814,6 +909,34 @@ class DownloadWorker(QThread):
                 self.remuxing_signal.emit(self.stream_url, False)
             self.log_signal.emit(self.username, message)
 
+        def report_resolution(resolution: str, fps: int) -> Optional[int]:
+            if self.cached_probe:
+                resolution, fps = self.cached_probe
+            detected_fps = fps or MAX_DOWNLOAD_FPS
+            self._last_detected_format = (
+                resolution or MAX_DOWNLOAD_RESOLUTION,
+                detected_fps,
+            )
+            self.resolution_signal.emit(self.stream_url, resolution, detected_fps)
+            if self.split_enabled:
+                self.target_duration_seconds = calculate_stream_segment_duration_seconds(
+                    self.stream_url,
+                    self.segment_size_mb,
+                    resolution or MAX_DOWNLOAD_RESOLUTION,
+                    detected_fps,
+                )
+                self.log_signal.emit(
+                    self.username,
+                    f"📦 {'Initial ' if self._during_split and STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(self.stream_url) else ''}"
+                    f"split target ({'during' if self.split_mode == 'during' else 'after'} recording): "
+                    f"{self.segment_size_mb} MB "
+                    f"({self.target_duration_seconds}s at {resolution or MAX_DOWNLOAD_RESOLUTION}, "
+                    f"{detected_fps} fps)",
+                )
+                if self._during_split:
+                    return self.target_duration_seconds or None
+            return None
+
         result = STRIPCHAT_ADAPTER.download(
             stream_url=self.stream_url,
             username=self.username,
@@ -825,9 +948,13 @@ class DownloadWorker(QThread):
             on_progress=lambda percent: self.progress_signal.emit(self.username, percent),
             on_error=lambda message: self.log_signal.emit(self.username, f"❌ Stripchat: {message}"),
             should_stop=lambda: self.manual_stop or self._stripchat_stop,
-            on_resolution=lambda resolution, fps: self.resolution_signal.emit(
-                self.stream_url, resolution, fps or MAX_DOWNLOAD_FPS
+            on_resolution=report_resolution,
+            segment_number=self.segment_number if self._during_split else None,
+            split_by_filesize=self.split_enabled,
+            max_duration_seconds=(
+                self.target_duration_seconds if self._during_split else 0
             ),
+            target_size_mb=self.segment_size_mb if self._during_split else 0,
         )
 
         # Always clear the remuxing flag when we exit, even on error
@@ -835,6 +962,14 @@ class DownloadWorker(QThread):
 
         self._stripchat_stop = False
         self.is_running = False
+        self.automatic_split = result.split_requested and not self.manual_stop
+        if (
+            self.split_enabled
+            and self.split_mode == "after"
+            and result.output_file
+            and result.status in ("success", "stopped")
+        ):
+            self._post_recording_split(result.output_file)
         return True
 
     def _probe_resolution(self) -> tuple[str, int]:
@@ -893,17 +1028,41 @@ class DownloadWorker(QThread):
     def run(self):
         if self.is_running:
             return
+        self.is_running = True
         try:
+            if self.manual_stop:
+                return
             if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(self.stream_url):
+                if self.split_enabled:
+                    self.target_duration_seconds = calculate_stream_segment_duration_seconds(
+                        self.stream_url,
+                        self.segment_size_mb,
+                        MAX_DOWNLOAD_RESOLUTION,
+                        MAX_DOWNLOAD_FPS,
+                    )
+                    self.log_signal.emit(
+                        self.username,
+                        f"📦 Initial split target fallback: {self.segment_size_mb} MB "
+                        f"({self.target_duration_seconds}s at {MAX_DOWNLOAD_RESOLUTION}, "
+                        f"{MAX_DOWNLOAD_FPS} fps)",
+                    )
+                if self.manual_stop:
+                    return
                 handled = self._run_stripchat_download()
                 if handled:
                     return
 
+            if self.manual_stop:
+                return
             if requires_authentication(self.stream_url, BROWSER):
                 raise RuntimeError(BROWSER_REQUIRED_MSG)
 
-            self.log_signal.emit(self.username, "🔍 Probing stream format…")
-            res, fps = self._probe_resolution()
+            if self.cached_probe and self.split_enabled and self.split_mode == "during":
+                res, fps = self.cached_probe
+                self.log_signal.emit(self.username, "📐 Reusing cached stream format")
+            else:
+                self.log_signal.emit(self.username, "🔍 Probing stream format…")
+                res, fps = self._probe_resolution()
 
             if res:
                 self.log_signal.emit(
@@ -925,6 +1084,23 @@ class DownloadWorker(QThread):
                 )
                 self._last_detected_format = None
 
+            if self.split_enabled:
+                self.target_duration_seconds = calculate_stream_segment_duration_seconds(
+                    self.stream_url,
+                    self.segment_size_mb,
+                    res or MAX_DOWNLOAD_RESOLUTION,
+                    fps or MAX_DOWNLOAD_FPS,
+                )
+                if self.target_duration_seconds <= 0:
+                    raise RuntimeError("Unable to estimate a segment duration from the configured bitrate table")
+                self.log_signal.emit(
+                    self.username,
+                    f"📦 Split target ({'during' if self.split_mode == 'during' else 'after'} recording): "
+                    f"{self.segment_size_mb} MB "
+                    f"({self.target_duration_seconds}s at {res or MAX_DOWNLOAD_RESOLUTION}, "
+                    f"{fps or MAX_DOWNLOAD_FPS} fps)",
+                )
+
             if fps and fps > MAX_DOWNLOAD_FPS:
                 self.log_signal.emit(
                     self.username,
@@ -934,20 +1110,36 @@ class DownloadWorker(QThread):
 
             self._started_at = time.time()
 
-            current_time = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
+            current_time = datetime.now().strftime(
+                "%Y-%m-%d %H_%M_%S_%f" if self.split_enabled
+                else "%Y-%m-%d %H_%M_%S"
+            )
+            filename_stem = f"{self.username} {current_time}"
+            if self._during_split:
+                filename_stem += f" segment {self.segment_number:03d}"
+            self._expected_output_stem = os.path.join(self.output_path, filename_stem)
+            if self.manual_stop:
+                return
 
             cmd = [
                 YTDLP_PATH,
                 "--no-simulate",
                 "--format", get_download_format_selector(),
+            ]
+            if self._during_split:
+                cmd.extend([
+                    "--download-sections",
+                    f"*0-{self.target_duration_seconds}",
+                ])
+            cmd.extend([
                 "-o", os.path.join(
                     self.output_path,
-                    f"{self.username} {current_time}.%(ext)s"
+                    f"{filename_stem}.%(ext)s"
                 ),
                 "--no-overwrites", "--continue", "--no-part",
                 "--skip-unavailable-fragments", "--hls-use-mpegts",
                 "--no-live-from-start",
-            ]
+            ])
             if DOWNLOAD_BANDWIDTH_LIMIT_ENABLED and DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S > 0:
                 # Cap this stream at its own admission-time estimate so actual
                 # throughput can't run past what the queue already assumed it
@@ -978,7 +1170,6 @@ class DownloadWorker(QThread):
                 )
 
             self.process = subprocess.Popen(cmd, **kwargs)
-            self.is_running = True
             self.log_signal.emit(self.username, f"▶ Download started (PID: {self.process.pid})")
 
             drain = threading.Thread(target=self._drain_stdout, args=(self.process,), daemon=True)
@@ -1034,12 +1225,46 @@ class DownloadWorker(QThread):
             try:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                pass
+                self._force_stop_process(self.process)
+                self.process.wait(timeout=5)
 
-            if self._started_at and not self.manual_stop:
+            has_nonempty_output = self._has_nonempty_output() if self.split_enabled else False
+            output_duration = (
+                self._get_output_duration_seconds() if has_nonempty_output else None
+            )
+            if output_duration is not None and self._during_split:
+                self.log_signal.emit(
+                    self.username,
+                    f"📦 Segment duration: {output_duration:.1f}s "
+                    f"(target {self.target_duration_seconds}s)",
+                )
+            split_duration_completed = (
+                self._during_split
+                and self.process.returncode == 0
+                and output_duration is not None
+                and output_duration >= max(1, self.target_duration_seconds - 2)
+            )
+            if (
+                self._started_at
+                and not self.manual_stop
+                and not split_duration_completed
+            ):
                 elapsed = int(time.time() - self._started_at)
                 if elapsed < AUTO_DOWNLOAD_DISABLE_SECONDS:
                     self.short_download_signal.emit(self.stream_url, elapsed)
+
+            if self._during_split and not self.manual_stop:
+                self.automatic_split = split_duration_completed and has_nonempty_output
+                if not self.automatic_split:
+                    self.log_signal.emit(
+                        self.username,
+                        "⚠ Segment ended before reaching its target duration, or its output "
+                        "could not be validated; not restarting",
+                    )
+            elif self.split_enabled and self.split_mode == "after" and has_nonempty_output:
+                output_path = self._find_output_file()
+                if output_path:
+                    self._post_recording_split(output_path)
 
         except Exception as e:
             hint = format_error_message(str(e))
@@ -1048,12 +1273,211 @@ class DownloadWorker(QThread):
             traceback.print_exc()
         finally:
             self.is_running = False
+            self._run_finished = True
             self.finished_signal.emit(self.stream_url)
+
+    def _has_nonempty_output(self) -> bool:
+        return self._find_output_file() is not None
+
+    def _find_output_file(self) -> Optional[str]:
+        if not self._expected_output_stem:
+            return None
+        try:
+            names = os.listdir(self.output_path)
+        except OSError as exc:
+            self.log_signal.emit(self.username, f"❌ Could not inspect segment output: {exc}")
+            return None
+        prefix = os.path.basename(self._expected_output_stem) + "."
+        found: list[str] = []
+        for name in names:
+            if not name.startswith(prefix) or name.lower().endswith((".part", ".temp")):
+                continue
+            path = os.path.join(self.output_path, name)
+            try:
+                if os.path.getsize(path) > 0:
+                    found.append(path)
+                else:
+                    os.remove(path)
+            except OSError as exc:
+                self.log_signal.emit(self.username, f"⚠ Could not inspect segment file {name}: {exc}")
+        return max(found, key=os.path.getmtime) if found else None
+
+    def _get_output_duration_seconds(self) -> Optional[float]:
+        path = self._find_output_file()
+        return self._probe_file_duration(path) if path else None
+
+    def _probe_file_duration(self, path: str) -> Optional[float]:
+        try:
+            result = subprocess.run(
+                [
+                    FFPROBE_PATH,
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                **_subprocess_kwargs(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.log_signal.emit(
+                self.username,
+                f"⚠ Could not verify recording duration with ffprobe: {exc}",
+            )
+            return None
+        if result.returncode != 0:
+            self.log_signal.emit(
+                self.username,
+                f"⚠ ffprobe could not read the recording: "
+                f"{format_error_message(result.stderr, result.stdout)}",
+            )
+            return None
+        try:
+            duration = float(result.stdout.strip())
+        except ValueError:
+            self.log_signal.emit(
+                self.username,
+                f"⚠ ffprobe returned an invalid duration: {result.stdout.strip()!r}",
+            )
+            return None
+        return duration if duration > 0 else None
+
+    def _post_recording_split(self, source_path: str) -> None:
+        duration = self._probe_file_duration(source_path)
+        if duration is None:
+            self.log_signal.emit(
+                self.username,
+                "⚠ Could not split recording; keeping the original file",
+            )
+            return
+        if duration < max(1, self.target_duration_seconds - 2):
+            self.log_signal.emit(
+                self.username,
+                f"📦 Recording is shorter than the estimated split target "
+                f"({duration:.1f}s of {self.target_duration_seconds}s); keeping one file",
+            )
+            return
+        if not FFMPEG_PATH:
+            self.log_signal.emit(
+                self.username,
+                "❌ FFmpeg is unavailable; keeping the original recording",
+            )
+            return
+
+        source_stem, source_extension = os.path.splitext(source_path)
+        container = source_extension.lstrip(".").lower()
+        if container in ("m4v", "m4a"):
+            container = "mp4"
+        if container not in ("mp4", "mkv", "webm", "mov", "ts"):
+            container = "mp4"
+        output_pattern = f"{source_stem} segment %03d.{container}"
+        self.log_signal.emit(self.username, "📦 Splitting finished recording with FFmpeg…")
+        self.remuxing_signal.emit(self.stream_url, True)
+        try:
+            result = subprocess.run(
+                [
+                    FFMPEG_PATH,
+                    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", source_path,
+                    "-map", "0:v?", "-map", "0:a?",
+                    "-c", "copy",
+                    "-f", "segment",
+                    "-segment_time", str(self.target_duration_seconds),
+                    "-segment_start_number", "1",
+                    "-reset_timestamps", "1",
+                    "-segment_format", container,
+                    output_pattern,
+                ],
+                capture_output=True,
+                text=True,
+                **_subprocess_kwargs(),
+            )
+        except OSError as exc:
+            self.log_signal.emit(
+                self.username,
+                f"❌ Could not run FFmpeg: {exc}; keeping the original recording",
+            )
+            return
+        finally:
+            self.remuxing_signal.emit(self.stream_url, False)
+
+        output_prefix = f"{source_stem} segment "
+        try:
+            parts = sorted(
+                os.path.join(self.output_path, name)
+                for name in os.listdir(self.output_path)
+                if name.startswith(os.path.basename(output_prefix))
+                and name.lower().endswith(f".{container}")
+            )
+        except OSError as exc:
+            self.log_signal.emit(
+                self.username,
+                f"❌ Could not inspect split output: {exc}; keeping the original recording",
+            )
+            return
+        valid_parts = [
+            path for path in parts
+            if os.path.isfile(path)
+            and os.path.getsize(path) > 0
+            and self._probe_file_duration(path) is not None
+        ]
+        if result.returncode != 0 or len(valid_parts) < 2 or len(valid_parts) != len(parts):
+            for path in parts:
+                try:
+                    os.remove(path)
+                except OSError as exc:
+                    self.log_signal.emit(
+                        self.username,
+                        f"⚠ Could not remove incomplete split output {os.path.basename(path)}: {exc}",
+                    )
+            error = format_error_message(result.stderr, result.stdout) if result.returncode else (
+                "FFmpeg did not produce at least two valid segments"
+            )
+            self.log_signal.emit(
+                self.username,
+                f"⚠ Post-recording split failed ({error}); keeping the original recording",
+            )
+            return
+
+        try:
+            os.remove(source_path)
+        except OSError as exc:
+            self.log_signal.emit(
+                self.username,
+                f"⚠ Split parts were saved, but the original could not be removed: {exc}",
+            )
+            return
+        self.log_signal.emit(
+            self.username,
+            f"✓ Split finished recording into {len(valid_parts)} files",
+        )
+
+    def _force_stop_process(self, proc: subprocess.Popen):
+        try:
+            parent = psutil.Process(proc.pid)
+            children = parent.children(recursive=True)
+            for process in children + [parent]:
+                try:
+                    process.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            alive = psutil.wait_procs(children + [parent], timeout=3)[1]
+            for process in alive:
+                try:
+                    process.kill()
+                except psutil.NoSuchProcess:
+                    pass
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            pass
+        except (psutil.AccessDenied, OSError) as exc:
+            self.log_signal.emit(self.username, f"❌ Stop error: {str(exc)[:80]}")
 
 
     def stop(self):
         """Signal the process tree to stop. Safe to call multiple times."""
-        if not self.is_running:
+        if not self.isRunning() or self._run_finished:
             return
 
         self.manual_stop = True
@@ -1069,42 +1493,7 @@ class DownloadWorker(QThread):
         self.log_signal.emit(self.username, "⏹ Stopping download…")
         if not proc:
             return
-
-        try:
-            parent = psutil.Process(proc.pid)
-            children = parent.children(recursive=True)
-
-            for p in children:
-                try:
-                    p.terminate()
-                except psutil.NoSuchProcess:
-                    pass
-
-            parent.terminate()
-
-            _gone, alive = psutil.wait_procs(
-                children + [parent],
-                timeout=5
-            )
-
-            for p in alive:
-                try:
-                    p.kill()
-                except psutil.NoSuchProcess:
-                    pass
-
-        except (psutil.NoSuchProcess, ProcessLookupError):
-            pass
-
-        except Exception as e:
-            self.log_signal.emit(
-                self.username,
-                f"❌ Stop error: {str(e)[:80]}"
-            )
-            print(
-                f"[Debug] DownloadWorker stop failed for {self.username}: {e!r}"
-            )
-            traceback.print_exc()
+        self._force_stop_process(proc)
 
 
 # ─────────────────────────────────────────────
@@ -1401,6 +1790,9 @@ def save_streams(stream_items: dict) -> None:
             "output_folder": DOWNLOAD_OUTPUT,
             "max_resolution": MAX_DOWNLOAD_RESOLUTION,
             "max_fps": MAX_DOWNLOAD_FPS,
+            "split_by_filesize": SPLIT_BY_FILESIZE_ENABLED,
+            "split_filesize_mb": SPLIT_FILESIZE_MB,
+            "split_filesize_mode": SPLIT_FILESIZE_MODE,
             "auto_timeout_seconds": AUTO_DOWNLOAD_DISABLE_SECONDS,
             "auto_reenable_cooldown_seconds": AUTO_REENABLE_COOLDOWN_SECONDS,
             "browser": BROWSER,
@@ -1575,11 +1967,32 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(620)
+        self.resize(760, 680)
         self._cookie_probe_cache: dict[str, bool] = {}  # real_browser -> accessible
         self._cookie_probe_workers: Dict[str, CookieProbeWorker] = {}  # real_browser -> in-flight worker
 
-        form = QFormLayout(self)
+        outer_layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+        outer_layout.addWidget(tabs)
+
+        general_page = QWidget()
+        browser_page = QWidget()
+        recording_page = QWidget()
+        general_form = QFormLayout(general_page)
+        browser_form = QFormLayout(browser_page)
+        recording_form = QFormLayout(recording_page)
+
+        for title, page in (
+            ("General", general_page),
+            ("Browser - Cookies", browser_page),
+            ("Recording", recording_page),
+        ):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            scroll.setWidget(page)
+            tabs.addTab(scroll, title)
 
         # ── Download output ──
         self.out_input = QLineEdit(DOWNLOAD_OUTPUT)
@@ -1589,7 +2002,7 @@ class SettingsDialog(QDialog):
         out_row = QHBoxLayout()
         out_row.addWidget(self.out_input)
         out_row.addWidget(out_browse)
-        form.addRow("Download output:", out_row)
+        general_form.addRow("Download output:", out_row)
 
         # ── Video quality ──
         self.resolution_combo = QComboBox()
@@ -1602,7 +2015,28 @@ class SettingsDialog(QDialog):
         quality_row.addWidget(self.fps_combo)
         quality_row.addWidget(QLabel("fps max"))
         quality_row.addStretch(1)
-        form.addRow("Video quality:", quality_row)
+        recording_form.addRow("Video quality:", quality_row)
+
+        self.split_enabled_check = QCheckBox("Split recordings by file size")
+        self.split_mode_combo = QComboBox()
+        self.split_mode_combo.addItems(list(_SPLIT_FILESIZE_MODES))
+        self.split_size_combo = QComboBox()
+        self.split_size_combo.addItems(list(_SEGMENT_SIZE_CHOICES))
+        split_row = QHBoxLayout()
+        split_row.addWidget(self.split_enabled_check)
+        split_row.addWidget(self.split_mode_combo)
+        split_row.addWidget(self.split_size_combo)
+        split_row.addStretch(1)
+        recording_form.addRow("Split by Filesize:", split_row)
+
+        split_hint = QLabel(
+            "Each segment's duration is estimated from the detected resolution and FPS. "
+            "Actual file sizes may vary. File-size splitting requires FFmpeg; post-recording "
+            "splitting also requires extra temporary disk space while FFmpeg creates segments."
+        )
+        split_hint.setWordWrap(True)
+        split_hint.setStyleSheet("color: #888; font-size: 11px;")
+        recording_form.addRow("", split_hint)
 
         # ── Auto-restart short-download protection ──
         self.auto_timeout_value_combo = QComboBox()
@@ -1619,7 +2053,7 @@ class SettingsDialog(QDialog):
         timeout_row.addWidget(self.auto_timeout_unit_combo)
         timeout_row.addWidget(self.auto_timeout_off_check)
         timeout_row.addStretch(1)
-        form.addRow("Disable auto-restart if shorter than:", timeout_row)
+        general_form.addRow("Disable auto-restart if shorter than:", timeout_row)
 
         timeout_hint = QLabel(
             "If a stream's auto-restarted recording ends before this much time has\n"
@@ -1627,7 +2061,7 @@ class SettingsDialog(QDialog):
             "restart-loop on flaky streams). Check \"Off\" to disable this protection entirely."
         )
         timeout_hint.setStyleSheet("color: #888; font-size: 11px;")
-        form.addRow("", timeout_hint)
+        general_form.addRow("", timeout_hint)
 
         # ── Auto re-enable cooldown ──
         self.cooldown_value_combo = QComboBox()
@@ -1644,7 +2078,7 @@ class SettingsDialog(QDialog):
         cooldown_row.addWidget(self.cooldown_unit_combo)
         cooldown_row.addWidget(self.cooldown_off_check)
         cooldown_row.addStretch(1)
-        form.addRow("Auto re-enable after:", cooldown_row)
+        general_form.addRow("Auto re-enable after:", cooldown_row)
 
         cooldown_hint = QLabel(
             "Once auto-restart gets disabled for a flaky stream (above), automatically\n"
@@ -1652,7 +2086,7 @@ class SettingsDialog(QDialog):
             "before retrying. \"Off\" (default) means re-checking Auto yourself instead."
         )
         cooldown_hint.setStyleSheet("color: #888; font-size: 11px;")
-        form.addRow("", cooldown_hint)
+        general_form.addRow("", cooldown_hint)
 
         # ── Cookies (always on — no toggle, just where to read them from) ──
         self.browser_combo = QComboBox()
@@ -1666,14 +2100,14 @@ class SettingsDialog(QDialog):
         cookie_row.addWidget(self.browser_combo)
         cookie_row.addWidget(self.firefox_variant_combo)
         cookie_row.addWidget(self._cookie_path_btn, 1)
-        form.addRow("Cookie source:", cookie_row)
+        browser_form.addRow("Cookie source:", cookie_row)
 
         self.fork_detect_warning = QLabel(
             "⚠ Couldn't auto-detect this browser's profile on this system — use Browse to point at it manually."
         )
         self.fork_detect_warning.setStyleSheet("color: #FF9800; font-size: 11px;")
         self.fork_detect_warning.setVisible(False)
-        form.addRow("", self.fork_detect_warning)
+        browser_form.addRow("", self.fork_detect_warning)
 
         cookie_hint = QLabel(
             "Cookies are always used — most streams need them now. Pick your browser —\n"
@@ -1682,7 +2116,7 @@ class SettingsDialog(QDialog):
             "point at a profile folder directly. Leave on Browse for the default profile."
         )
         cookie_hint.setStyleSheet("color: #888; font-size: 11px;")
-        form.addRow("", cookie_hint)
+        browser_form.addRow("", cookie_hint)
 
         # ── Cookies file fallback (Chromium browsers on Windows only) ──
         self._cookies_file = ""
@@ -1696,7 +2130,7 @@ class SettingsDialog(QDialog):
         cookies_file_row.addWidget(self._cookies_file_btn, 1)
         cookies_file_row.addWidget(self._cookies_file_clear_btn)
         self._cookies_file_label = QLabel("Cookies file:")
-        form.addRow(self._cookies_file_label, cookies_file_row)
+        browser_form.addRow(self._cookies_file_label, cookies_file_row)
 
         self._cookies_file_hint = QLabel(
             "Optional fallback for Chrome/Edge/Brave/Opera on Windows, where browser<br>"
@@ -1708,12 +2142,12 @@ class SettingsDialog(QDialog):
         self._cookies_file_hint.setTextFormat(Qt.TextFormat.RichText)
         self._cookies_file_hint.setOpenExternalLinks(True)
         self._cookies_file_hint.setStyleSheet("color: #888; font-size: 11px;")
-        form.addRow("", self._cookies_file_hint)
+        browser_form.addRow("", self._cookies_file_hint)
 
         # ── User-Agent ──
         self.user_agent_input = QLineEdit()
         self.user_agent_input.setPlaceholderText("e.g. Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...")
-        form.addRow("User-Agent:", self.user_agent_input)
+        browser_form.addRow("User-Agent:", self.user_agent_input)
 
         ua_hint = QLabel(
             "Often needed to get past Cloudflare's Turnstile check. Find yours by searching\n"
@@ -1721,7 +2155,7 @@ class SettingsDialog(QDialog):
             "cookies came from."
         )
         ua_hint.setStyleSheet("color: #888; font-size: 11px;")
-        form.addRow("", ua_hint)
+        browser_form.addRow("", ua_hint)
 
         # ── Download Bandwidth ──
         self.download_speed_test_btn = QPushButton("Test Download Speed")
@@ -1731,7 +2165,7 @@ class SettingsDialog(QDialog):
         speed_row = QHBoxLayout()
         speed_row.addWidget(self.download_speed_test_btn)
         speed_row.addWidget(self.download_speed_result_label, 1)
-        form.addRow("Download Bandwidth:", speed_row)
+        general_form.addRow("Download Bandwidth:", speed_row)
 
         self.download_limit_check = QCheckBox("Limit to")
         self.download_limit_check.setToolTip("Limit downloads based on estimated connection speed")
@@ -1745,11 +2179,11 @@ class SettingsDialog(QDialog):
         limit_row.addWidget(self.download_percent_combo)
         limit_row.addWidget(QLabel("of measured speed"))
         limit_row.addStretch(1)
-        form.addRow("", limit_row)
+        general_form.addRow("", limit_row)
 
         self.download_limit_label = QLabel("Run a speed test above to enable bandwidth limiting")
         self.download_limit_label.setStyleSheet("color: #8fb3ff; font-size: 12px;")
-        form.addRow("", self.download_limit_label)
+        general_form.addRow("", self.download_limit_label)
 
         bandwidth_hint = QLabel(
             "The speed test downloads 30 MB from Cloudflare to estimate your connection speed. "
@@ -1758,12 +2192,12 @@ class SettingsDialog(QDialog):
         )
         bandwidth_hint.setWordWrap(True)
         bandwidth_hint.setStyleSheet("color: #888; font-size: 11px;")
-        form.addRow("", bandwidth_hint)
+        general_form.addRow("", bandwidth_hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.close)
         buttons.accepted.connect(self.close)
-        form.addRow(buttons)
+        outer_layout.addWidget(buttons)
 
         self._load_from_globals()
 
@@ -1771,6 +2205,9 @@ class SettingsDialog(QDialog):
         self.out_input.textChanged.connect(self._on_output_changed)
         self.resolution_combo.currentTextChanged.connect(self._on_resolution_changed)
         self.fps_combo.currentTextChanged.connect(self._on_fps_changed)
+        self.split_enabled_check.toggled.connect(self._on_split_enabled_changed)
+        self.split_mode_combo.currentTextChanged.connect(self._on_split_mode_changed)
+        self.split_size_combo.currentTextChanged.connect(self._on_split_size_changed)
         self.auto_timeout_value_combo.currentTextChanged.connect(self._on_auto_timeout_changed)
         self.auto_timeout_unit_combo.currentTextChanged.connect(self._on_auto_timeout_changed)
         self.auto_timeout_custom_spin.valueChanged.connect(self._on_auto_timeout_changed)
@@ -1791,6 +2228,19 @@ class SettingsDialog(QDialog):
             self.resolution_combo.setCurrentText(MAX_DOWNLOAD_RESOLUTION)
         if str(MAX_DOWNLOAD_FPS) in _FPS_CHOICES:
             self.fps_combo.setCurrentText(str(MAX_DOWNLOAD_FPS))
+        self.split_enabled_check.setChecked(SPLIT_BY_FILESIZE_ENABLED)
+        mode_label = next(
+            (label for label, mode in _SPLIT_FILESIZE_MODES.items() if mode == SPLIT_FILESIZE_MODE),
+            "Split during recording",
+        )
+        self.split_mode_combo.setCurrentText(mode_label)
+        size_label = next(
+            (label for label, size_mb in _SEGMENT_SIZE_CHOICES.items() if size_mb == SPLIT_FILESIZE_MB),
+            "500 MB",
+        )
+        self.split_mode_combo.setEnabled(SPLIT_BY_FILESIZE_ENABLED)
+        self.split_size_combo.setCurrentText(size_label)
+        self.split_size_combo.setEnabled(SPLIT_BY_FILESIZE_ENABLED)
         is_off = AUTO_DOWNLOAD_DISABLE_SECONDS <= 0
         self.auto_timeout_off_check.setChecked(is_off)
         value, unit, numeric = _seconds_to_value_unit(
@@ -1849,6 +2299,25 @@ class SettingsDialog(QDialog):
         global MAX_DOWNLOAD_FPS
         MAX_DOWNLOAD_FPS = int(text)
         self.settings_changed.emit()
+
+    def _on_split_enabled_changed(self, enabled: bool):
+        global SPLIT_BY_FILESIZE_ENABLED
+        SPLIT_BY_FILESIZE_ENABLED = bool(enabled)
+        self.split_mode_combo.setEnabled(SPLIT_BY_FILESIZE_ENABLED)
+        self.split_size_combo.setEnabled(SPLIT_BY_FILESIZE_ENABLED)
+        self.settings_changed.emit()
+
+    def _on_split_mode_changed(self, label: str):
+        global SPLIT_FILESIZE_MODE
+        if label in _SPLIT_FILESIZE_MODES:
+            SPLIT_FILESIZE_MODE = _SPLIT_FILESIZE_MODES[label]
+            self.settings_changed.emit()
+
+    def _on_split_size_changed(self, label: str):
+        global SPLIT_FILESIZE_MB
+        if label in _SEGMENT_SIZE_CHOICES:
+            SPLIT_FILESIZE_MB = _SEGMENT_SIZE_CHOICES[label]
+            self.settings_changed.emit()
 
     def _on_auto_timeout_changed(self, _=None):
         global AUTO_DOWNLOAD_DISABLE_SECONDS
@@ -2174,6 +2643,9 @@ class StreamDownloaderGUI(QMainWindow):
         self.download_workers: Dict[str, DownloadWorker] = {}
         self.download_timers: Dict[str, DownloadTimer]   = {}
         self.stream_items: Dict[str, StreamItem]         = {}
+        self.split_sessions: dict[str, dict[str, int]] = {}
+        self.probe_cache: dict[str, tuple[str, int]] = {}
+        self._probe_cache_generation: dict[str, int] = {}
         self.auto_checkboxes: Dict[str, QCheckBox] = {}
         self._auto_disabled: Dict[str, str] = {}  # url -> username, for the disabled-auto-restart banner
         self._reenable_timers: Dict[str, QTimer] = {}
@@ -2248,6 +2720,38 @@ class StreamDownloaderGUI(QMainWindow):
             global MAX_DOWNLOAD_FPS
             MAX_DOWNLOAD_FPS = int(saved_fps)
             self._settings_dialog.fps_combo.setCurrentText(saved_fps)
+
+        saved_split_enabled = settings.get("split_by_filesize")
+        if isinstance(saved_split_enabled, bool):
+            global SPLIT_BY_FILESIZE_ENABLED
+            SPLIT_BY_FILESIZE_ENABLED = saved_split_enabled
+            self._settings_dialog.split_enabled_check.setChecked(saved_split_enabled)
+
+        saved_split_size = settings.get("split_filesize_mb")
+        try:
+            saved_split_size = int(saved_split_size)
+        except (TypeError, ValueError):
+            saved_split_size = None
+        if saved_split_size in _SEGMENT_SIZE_CHOICES.values():
+            global SPLIT_FILESIZE_MB
+            SPLIT_FILESIZE_MB = saved_split_size
+            size_label = next(
+                label for label, size_mb in _SEGMENT_SIZE_CHOICES.items()
+                if size_mb == saved_split_size
+            )
+            self._settings_dialog.split_size_combo.setCurrentText(size_label)
+            self._settings_dialog.split_size_combo.setEnabled(SPLIT_BY_FILESIZE_ENABLED)
+
+        saved_split_mode = str(settings.get("split_filesize_mode", "during") or "during")
+        if saved_split_mode in _SPLIT_FILESIZE_MODES.values():
+            global SPLIT_FILESIZE_MODE
+            SPLIT_FILESIZE_MODE = saved_split_mode
+            mode_label = next(
+                label for label, mode in _SPLIT_FILESIZE_MODES.items()
+                if mode == saved_split_mode
+            )
+            self._settings_dialog.split_mode_combo.setCurrentText(mode_label)
+            self._settings_dialog.split_mode_combo.setEnabled(SPLIT_BY_FILESIZE_ENABLED)
 
         saved_auto_timeout = settings.get("auto_timeout_seconds", None)
         if saved_auto_timeout is not None:
@@ -2706,7 +3210,25 @@ class StreamDownloaderGUI(QMainWindow):
                 return
             item.queued = False
 
-        worker = DownloadWorker(url, item.username, self._out_input.text().strip() or "Downloads")
+        segment_number = None
+        during_split_enabled = (
+            SPLIT_BY_FILESIZE_ENABLED and SPLIT_FILESIZE_MODE == "during"
+        )
+        if during_split_enabled:
+            split_session = self.split_sessions.setdefault(url, {"next_segment": 1})
+            segment_number = split_session["next_segment"]
+        else:
+            self.split_sessions.pop(url, None)
+
+        cached_probe = self.probe_cache.get(url) if during_split_enabled else None
+        worker = DownloadWorker(
+            url,
+            item.username,
+            self._out_input.text().strip() or "Downloads",
+            segment_number=segment_number,
+            cached_probe=cached_probe,
+            probe_cache_generation=self._probe_cache_generation.get(url, 0),
+        )
         worker.setParent(self)
         worker.log_signal.connect(self._on_dl_log)
         worker.finished_signal.connect(self._on_dl_finished)
@@ -2729,7 +3251,13 @@ class StreamDownloaderGUI(QMainWindow):
         self._update_download_info()
         self._log_msg(f"🚀 Started: {item.username}", "#4CAF50")
 
+    def _clear_probe_cache(self, url: str):
+        self.probe_cache.pop(url, None)
+        self._probe_cache_generation[url] = self._probe_cache_generation.get(url, 0) + 1
+
     def _stop_download(self, url: str):
+        self.split_sessions.pop(url, None)
+        self._clear_probe_cache(url)
         worker = self.download_workers.get(url)
         if worker:
             worker.stop()
@@ -2798,6 +3326,8 @@ class StreamDownloaderGUI(QMainWindow):
         old = item.current_status
         item.current_status = status
         item.last_check_time = time.time()
+        if status != old:
+            self._clear_probe_cache(url)
 
         if status == StreamStatus.ERROR and message == CHROMIUM_COOKIE_ERROR_MSG:
             self._maybe_show_chromium_cookie_dialog()
@@ -2851,6 +3381,7 @@ class StreamDownloaderGUI(QMainWindow):
             self._log_msg(f"🎬 Auto-start: {item.username}", "#4CAF50")
             self._manual_start(url)
         elif status in (StreamStatus.OFFLINE, StreamStatus.PRIVATE, StreamStatus.AWAY):
+            self.split_sessions.pop(url, None)
             if item.queued:
                 item.queued = False
                 self._log_msg(f"🧹 Cleared queued state for {item.username}: stream went {status.value}", "#777")
@@ -2864,6 +3395,15 @@ class StreamDownloaderGUI(QMainWindow):
             return
         item.resolution = res
         item.fps = fps or 30
+        worker = self.download_workers.get(url)
+        if (
+            res
+            and worker
+            and worker.split_enabled
+            and worker.split_mode == "during"
+            and worker.probe_cache_generation == self._probe_cache_generation.get(url, 0)
+        ):
+            self.probe_cache[url] = (res, fps or 30)
 
         # Set the Res column (col 5)
         res_lbl = self._table.cellWidget(item.row, 5)
@@ -2969,10 +3509,42 @@ class StreamDownloaderGUI(QMainWindow):
         self._browser_unset_banner.setVisible(not BROWSER)
 
     def _on_dl_finished(self, url: str):
+        worker = self.download_workers.get(url)
         item = self.stream_items.get(url)
         if item:
             self._log_msg(f"✓ Finished: {item.username}", "#4CAF50")
+        should_continue_split = bool(
+            worker
+            and worker.automatic_split
+            and not worker.manual_stop
+            and SPLIT_BY_FILESIZE_ENABLED
+            and SPLIT_FILESIZE_MODE == "during"
+            and worker.split_mode == "during"
+            and url in self.split_sessions
+            and item
+            and item.current_status == StreamStatus.ONLINE
+        )
+        if should_continue_split and worker:
+            self.split_sessions[url]["next_segment"] = (worker.segment_number or 0) + 1
+        else:
+            self.split_sessions.pop(url, None)
+            self._clear_probe_cache(url)
+
         self._cleanup_download(url)
+        if should_continue_split:
+            if worker and not worker.isRunning():
+                self._log_msg(
+                    f"📦 Starting segment {self.split_sessions[url]['next_segment']} "
+                    f"for {item.username}",
+                    "#4CAF50",
+                )
+                self._manual_start(url)
+            else:
+                self.split_sessions.pop(url, None)
+                self._log_msg(
+                    f"⚠ Previous segment did not release its worker; stopping split recording",
+                    "#FF9800",
+                )
         # Schedule a status re-check a few seconds after the download ends.
         # This avoids hammering the site immediately while still updating much
         # faster than waiting for the next full CHECK_INTERVAL cycle.
@@ -3144,6 +3716,12 @@ class StreamDownloaderGUI(QMainWindow):
         """Cross-platform process health check."""
         for url, worker in list(self.download_workers.items()):
             if not (worker and worker.process):
+                continue
+            # The worker owns normal subprocess completion: it still needs to
+            # drain yt-dlp output and validate/remux a duration-limited segment
+            # before emitting finished_signal. Cleaning up as soon as poll()
+            # sees an exited child can mark a successful split as a manual stop.
+            if worker.process.poll() is not None:
                 continue
             pid = worker.process.pid
             try:

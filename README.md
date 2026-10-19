@@ -133,15 +133,26 @@ No venv activation or interpreter path needed either way — it relaunches itsel
 
 Everything setup-related lives in one dialog (click **⚙ Settings** in the toolbar) instead of the main window, and every field here is saved automatically and restored next time you open the app.
 
-**Download output** — the folder downloads are saved to. Type a path or use Browse.
+Settings are organized into three tabs:
 
-**Video quality** — maximum resolution and FPS to download at (yt-dlp falls back gracefully through lower tiers if your exact preference isn't available for a given stream).
+**General** — output folder, auto-restart protections, and optional download bandwidth limiting.
+
+**Browser & Cookies** — cookie source/browser selection, browser profile or cookies file, and User-Agent.
+
+**Recording** — maximum resolution and FPS (yt-dlp falls back gracefully through lower tiers if your exact preference isn't available), plus optional **Split by Filesize**. Choose 250 MB, 500 MB, 750 MB, 1 GB, 1.5 GB, 2 GB, 2.5GB or 3 GB per segment, then choose a mode:
+
+- **Split during recording** stops and finalizes each estimated-duration segment before starting the next. Segments are saved to the configured output folder with sequential numbers. A brief gap may occur between segments. For Stripchat, the first two-second media segment is used to estimate the live bitrate and calibrate the segment duration, rather than relying only on the bitrate table.
+- **Split after recording** records continuously, then uses FFmpeg to split the completed recording. This avoids restarting the stream download, but requires extra temporary disk space while the original and split files coexist. The original is removed only after multiple valid segment files have been created; otherwise it is kept.
+
+Outside Stripchat's during-recording calibration, segment duration is estimated from the detected resolution/FPS and bitrate table, so actual file sizes may vary. File-size splitting requires FFmpeg. Leave splitting off to keep recordings continuous in a single file.
+
+During-recording splits reuse the stream's detected resolution and FPS for later segments. The cached probe is cleared when the stream status changes, the stream ends, or you stop recording manually.
 
 **Disable auto-restart if shorter than** — if a stream's auto-restarted recording ends before this much time has passed, auto-restart is temporarily disabled for that stream, to protect against a restart-loop on flaky streams. Pick a value (2/5/10/15/20/30, or `Custom` for an exact number) and a unit (seconds/minutes), or check **Off** to disable this protection entirely.
 
 **Auto re-enable after** — once auto-restart gets disabled for a flaky stream (above), automatically re-check Auto for it after this much time, giving the stream a chance to settle before retrying. Pick a value (5/10/15/30/60, or `Custom`) and a unit (minutes/hours), or check **Off** (the default) to require re-checking Auto yourself instead — no set-and-forget retry.
 
-**Cookie source** — cookies are always used now; Chaturbate has been tightening access controls over time, and in practice most streams need them to work at all, not just private/age-restricted ones. Pick which browser you're logged into Chaturbate with from the dropdown:
+**Cookie source** — cookies are always used now; Chaturbate has been tightening access controls over time, and in practice most streams need them to work at all, not just private/age-restricted ones. Pick which browser you're logged into Chaturbate with from the dropdown in **Browser & Cookies**:
 
 `chrome`, `chromium`, `edge`, `brave`, `opera`, `safari`, `Firefox-based`
 

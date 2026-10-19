@@ -144,6 +144,20 @@ MOUFLON_URL_RE = re.compile(r"#EXT-X-MOUFLON:URI:(https?://[^\r\n]+)")
 PART_SEGMENT_RE = re.compile(r"_part\d+\.mp4$")
 SEGMENT_SEQUENCE_RE = re.compile(r"_(\d+)\.mp4$")
 MOUFLON_SEGMENT_RE = re.compile(r"_([^_]+)_(\d+(?:_part\d+)?)\.mp4")
+STRIPCHAT_MEDIA_SEGMENT_SECONDS = 2.0
+STRIPCHAT_CALIBRATION_SIZE_FACTOR = 0.90
+
+
+def calculate_segment_count_for_size(target_size_mb: int, segment_bytes: int) -> int:
+    """Estimate the number of two-second media segments for a target file size."""
+    if target_size_mb <= 0 or segment_bytes <= 0:
+        return 0
+    target_bytes = target_size_mb * 1024 * 1024
+    return max(
+        1,
+        int(target_bytes * STRIPCHAT_CALIBRATION_SIZE_FACTOR / segment_bytes),
+    )
+
 
 @functools.lru_cache(maxsize=512)
 def get_pdkey_digest(pdkey: str) -> bytes:
@@ -206,6 +220,8 @@ class DownloadRequest:
     remux_on_finish: bool = True
     user_agent: Optional[str] = None
     ffmpeg_path: str = "ffmpeg"
+    max_duration_seconds: int = 0
+    target_size_mb: int = 0
 
 
 @dataclass(frozen=True)
@@ -214,6 +230,8 @@ class StripchatDownloadResult:
 
     status: str
     message: str = ""
+    split_requested: bool = False
+    output_file: Optional[str] = None
 
 @dataclass
 class DownloadProgress:
@@ -254,6 +272,7 @@ class StripchatDownloader(QThread):
         self._running = True
         self._temp_file: Optional[str] = None
         self._ffmpeg_process: Optional[subprocess.Popen] = None
+        self.duration_reached = False
 
     def stop(self):
         """Stop the download gracefully.
@@ -340,8 +359,32 @@ class StripchatDownloader(QThread):
             with open(temp_file, "wb") as container:
                 container.write(init_response.content)
                 bytes_downloaded += len(init_response.content)
+                download_started_at = time.monotonic()
+                target_segment_count: Optional[int] = None
 
                 while self._running:
+                    duration_limit_reached = (
+                        target_segment_count is not None
+                        and segment_count >= target_segment_count
+                    )
+                    fallback_duration_reached = (
+                        target_segment_count is None
+                        and self.request.max_duration_seconds > 0
+                        and time.monotonic() - download_started_at
+                        >= self.request.max_duration_seconds
+                    )
+                    if duration_limit_reached or fallback_duration_reached:
+                        self.duration_reached = True
+                        target_duration = (
+                            target_segment_count * STRIPCHAT_MEDIA_SEGMENT_SECONDS
+                            if target_segment_count is not None
+                            else self.request.max_duration_seconds
+                        )
+                        self.log_signal.emit(
+                            f"Segment duration reached ({target_duration:g}s); "
+                            "finalizing segment."
+                        )
+                        break
                     try:
                         response = session.get(info.playlist_url, headers=headers, timeout=10)
                         response.raise_for_status()
@@ -394,14 +437,57 @@ class StripchatDownloader(QThread):
                             downloaded_segment = True
                             container.flush()
 
+                            if (
+                                self.request.target_size_mb > 0
+                                and target_segment_count is None
+                                and byte_count > 0
+                            ):
+                                target_segment_count = calculate_segment_count_for_size(
+                                    self.request.target_size_mb,
+                                    byte_count,
+                                )
+                                measured_mbps = (
+                                    byte_count
+                                    * 8
+                                    / STRIPCHAT_MEDIA_SEGMENT_SECONDS
+                                    / 1_000_000
+                                )
+                                calibrated_duration = (
+                                    target_segment_count
+                                    * STRIPCHAT_MEDIA_SEGMENT_SECONDS
+                                )
+                                self.log_signal.emit(
+                                    f"Calibrated from first "
+                                    f"{STRIPCHAT_MEDIA_SEGMENT_SECONDS:g}s segment "
+                                    f"({byte_count:,} bytes, {measured_mbps:.2f} Mbps): "
+                                    f"targeting {target_segment_count} segments "
+                                    f"({calibrated_duration:g}s) for "
+                                    f"{self.request.target_size_mb} MB."
+                                )
+
                             self.progress_signal.emit(DownloadProgress(
                                 segment_count=segment_count,
                                 bytes_downloaded=bytes_downloaded,
                                 current_segment=sequence,
                             ))
 
+                            if (
+                                target_segment_count is not None
+                                and segment_count >= target_segment_count
+                            ):
+                                self.duration_reached = True
+                                self.log_signal.emit(
+                                    f"Calibrated segment count reached "
+                                    f"({segment_count}/{target_segment_count}); "
+                                    "finalizing segment."
+                                )
+                                break
+
                         except Exception as e:
                             self.log_signal.emit(f"Failed to download segment {sequence}: {e}")
+
+                    if self.duration_reached:
+                        break
 
                     if downloaded_segment:
                         last_new_segment_at = time.monotonic()
@@ -412,6 +498,8 @@ class StripchatDownloader(QThread):
                     time.sleep(2)
 
             if segment_count == 0:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
                 self.error_signal.emit("No segments were downloaded")
                 return
 
@@ -456,6 +544,10 @@ class StripchatDownloader(QThread):
                     raise RuntimeError(
                         f"ffmpeg exited with code {self._ffmpeg_process.returncode}"
                     )
+                if not os.path.isfile(output_file) or os.path.getsize(output_file) == 0:
+                    if os.path.exists(output_file):
+                        os.unlink(output_file)
+                    raise RuntimeError("ffmpeg produced no usable output file")
                 self.log_signal.emit(f"Remuxed to: {output_file}")
 
                 # Clean up temp file
@@ -493,27 +585,29 @@ class StripchatDownloader(QThread):
 #  Core Functions
 # ─────────────────────────────────────────────
 
+def extract_preloaded_state(username: str, user_agent: Optional[str] = None) -> dict:
+    """Fetch and return the full PRELOADED_STATE object from a model page."""
+    _, page_headers = get_user_agent_headers(user_agent)
+    url = f"https://stripchat.com/{username}"
+    response = requests.get(url, headers=page_headers, timeout=8)
+    response.raise_for_status()
+
+    match = re.search(
+        r'<script\b[^>]*>\s*window\.__PRELOADED_STATE__\s*=\s*({.*?})\s*</script>',
+        response.text,
+        re.DOTALL,
+    )
+    if not match:
+        raise RuntimeError("PRELOADED_STATE not found in page")
+    return json.loads(match.group(1))
+
+
 def extract_stripchat_data(username: str, user_agent: Optional[str] = None) -> dict:
     """
     Extract model ID, stream status, and HLS master playlist from Stripchat.
     Returns a dict with modelId, isLive, status, and hlsPlaylist.
     """
-    _, page_headers = get_user_agent_headers(user_agent)
-    url = f"https://stripchat.com/{username}"
-    response = requests.get(url, headers=page_headers, timeout=8)
-    response.raise_for_status()
-    html = response.text
-
-    # Find PRELOADED_STATE
-    match = re.search(
-        r'<script\b[^>]*>\s*window\.__PRELOADED_STATE__\s*=\s*({.*?})\s*</script>',
-        html,
-        re.DOTALL,
-    )
-    if not match:
-        raise RuntimeError("PRELOADED_STATE not found in page")
-
-    data = json.loads(match.group(1))
+    data = extract_preloaded_state(username, user_agent=user_agent)
     view_cam = data.get("viewCam", {})
     model = view_cam.get("model", {})
 
@@ -953,20 +1047,22 @@ class StripchatSiteAdapter:
         on_progress: Optional[Callable[[int], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
-        on_resolution: Optional[Callable[[str, int], None]] = None,
+        on_resolution: Optional[Callable[[str, int], Optional[int]]] = None,
+        segment_number: Optional[int] = None,
+        split_by_filesize: bool = False,
+        max_duration_seconds: int = 0,
+        target_size_mb: int = 0,
     ) -> StripchatDownloadResult:
         """Run one native download and wait for its complete lifecycle."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
-        output_file = os.path.join(output_directory, f"{username} {timestamp}.mp4")
-        request = DownloadRequest(
-            stream_url=stream_url,
-            output_file=output_file,
-            target_height=target_height,
-            user_agent=user_agent or None,
-            ffmpeg_path=ffmpeg_path,
-            remux_on_finish=True,
+        timestamp = datetime.now().strftime(
+            "%Y-%m-%d %H_%M_%S_%f" if segment_number is not None or split_by_filesize
+            else "%Y-%m-%d %H_%M_%S"
         )
-
+        output_stem = f"{username} {timestamp}"
+        if segment_number is not None:
+            output_stem += f" segment {segment_number:03d}"
+        output_file = os.path.join(output_directory, f"{output_stem}.mp4")
+        effective_max_duration_seconds = max_duration_seconds
         try:
             info = get_stream_info(
                 stream_url,
@@ -974,12 +1070,27 @@ class StripchatSiteAdapter:
                 user_agent=user_agent or None,
             )
             if info and on_resolution:
-                on_resolution(f"{info.width}x{info.height}", int(round(info.fps or 0)))
+                probed_duration = on_resolution(
+                    f"{info.width}x{info.height}", int(round(info.fps or 0))
+                )
+                if probed_duration and probed_duration > 0:
+                    effective_max_duration_seconds = probed_duration
         except Exception as exc:
             if on_log:
                 on_log(f"Resolution probe failed: {exc}")
 
-        outcome = {"status": "running", "message": ""}
+        request = DownloadRequest(
+            stream_url=stream_url,
+            output_file=output_file,
+            target_height=target_height,
+            user_agent=user_agent or None,
+            ffmpeg_path=ffmpeg_path,
+            remux_on_finish=True,
+            max_duration_seconds=effective_max_duration_seconds,
+            target_size_mb=target_size_mb,
+        )
+
+        outcome = {"status": "running", "message": "", "output_file": ""}
 
         def handle_error(message: str):
             outcome["status"] = "error"
@@ -991,6 +1102,9 @@ class StripchatSiteAdapter:
             if on_progress and progress.total_segments:
                 percent = int((progress.segment_count / progress.total_segments) * 100)
                 on_progress(max(0, min(100, percent)))
+
+        def handle_finished(path: str):
+            outcome["output_file"] = path
 
         downloader = StripchatDownloader(request)
         if on_log:
@@ -1004,6 +1118,9 @@ class StripchatSiteAdapter:
         downloader.error_signal.connect(
             handle_error, Qt.ConnectionType.DirectConnection
         )
+        downloader.finished_signal.connect(
+            handle_finished, Qt.ConnectionType.DirectConnection
+        )
 
         if on_log:
             on_log("Using Stripchat native downloader...")
@@ -1016,16 +1133,25 @@ class StripchatSiteAdapter:
 
         downloader.wait(15000)
         if outcome["status"] == "error":
-            return StripchatDownloadResult("error", outcome["message"])
+            return StripchatDownloadResult(
+                "error", outcome["message"], output_file=outcome["output_file"] or None
+            )
         if should_stop and should_stop():
-            return StripchatDownloadResult("stopped", "Stop requested")
+            return StripchatDownloadResult(
+                "stopped", "Stop requested", output_file=outcome["output_file"] or None
+            )
         if outcome["status"] == "running":
             outcome["status"] = "success"
         else:
             outcome["status"] = "error"
             outcome["message"] = "Native downloader ended without a terminal result"
 
-        return StripchatDownloadResult(outcome["status"], outcome["message"])
+        return StripchatDownloadResult(
+            outcome["status"],
+            outcome["message"],
+            split_requested=downloader.duration_reached,
+            output_file=outcome["output_file"] or None,
+        )
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  COMMAND-LINE TESTING
@@ -1063,7 +1189,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Save PRELOADED_STATE to a file for debugging"
+        help="Save the complete PRELOADED_STATE object to a JSON file for debugging"
     )
 
     args = parser.parse_args()
@@ -1074,6 +1200,14 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.DEBUG)
 
     try:
+        username = args.url.rstrip("/").split("/")[-1]
+        if args.debug:
+            data = extract_preloaded_state(username)
+            debug_file = f"debug_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(debug_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"🐛 Complete PRELOADED_STATE saved to: {os.path.abspath(debug_file)}")
+
         # Default: Show stream info
         print(f"Getting stream info for: {args.url}")
         print("=" * 60)
@@ -1101,18 +1235,6 @@ if __name__ == "__main__":
         print(f"FPS:            {info.fps or 'Unknown'}")
         print(f"Playlist URL:   {info.playlist_url[:80]}...")
         print("=" * 60)
-
-        # Debug: Save PRELOADED_STATE to file
-        if args.debug:
-            import json
-            from datetime import datetime
-
-            username = args.url.rstrip("/").split("/")[-1]
-            data = extract_stripchat_data(username)
-            debug_file = f"debug_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(debug_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            print(f"🐛 Debug data saved to: {debug_file}")
 
     except Exception as e:
         print(f"\n❌ Error: {e}")
