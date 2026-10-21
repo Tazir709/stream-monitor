@@ -172,12 +172,14 @@ STREAM_STATUS_P2P = "p2p"
 STREAM_STATUS_AWAY = "away"
 STREAM_STATUS_IDLE = "idle"
 STREAM_STATUS_OFF = "off"
+STREAM_STATUS_VIRTUAL_PRIVATE = "virtualPrivate"
 
 # Statuses that are inaccessible for downloading
 INACCESSIBLE_STATUSES = {
     STREAM_STATUS_GROUP_SHOW,
     STREAM_STATUS_PRIVATE,
     STREAM_STATUS_P2P,
+    STREAM_STATUS_VIRTUAL_PRIVATE,
 }
 
 def get_user_agent_headers(user_agent: Optional[str] = None):
@@ -311,6 +313,7 @@ class StripchatDownloader(QThread):
                     STREAM_STATUS_GROUP_SHOW: "Ticket/Group show - requires purchase",
                     STREAM_STATUS_PRIVATE: "Private show - not accessible",
                     STREAM_STATUS_P2P: "P2P show - requires payment",
+                    STREAM_STATUS_VIRTUAL_PRIVATE: "Virtual private show - not accessible",
                 }.get(info.status, f"Stream status: {info.status}")
                 self.error_signal.emit(f"Stream not accessible: {status_msg}")
                 return
@@ -690,6 +693,8 @@ def get_stream_info(stream_url: str, target_height: int = 1080, user_agent: Opti
             raise RuntimeError(f"{username} is in a private show - not accessible")
         elif status == STREAM_STATUS_P2P:
             raise RuntimeError(f"{username} is in a P2P show - requires payment")
+        elif status == STREAM_STATUS_VIRTUAL_PRIVATE:
+            raise RuntimeError(f"{username} is in a virtual private show - not accessible")
         elif status == STREAM_STATUS_AWAY:
             raise RuntimeError(f"{username} is currently away")
         elif status == STREAM_STATUS_OFF:
@@ -1008,6 +1013,7 @@ class StripchatSiteAdapter:
             STREAM_STATUS_GROUP_SHOW: ("private", "🎫 Ticket show"),
             STREAM_STATUS_PRIVATE: ("private", "🔒 Private show"),
             STREAM_STATUS_P2P: ("private", "💰 P2P show"),
+            STREAM_STATUS_VIRTUAL_PRIVATE: ("private", "🔒 Virtual private show"),
             STREAM_STATUS_AWAY: ("away", "🌙 Away"),
             STREAM_STATUS_IDLE: ("offline", "💤 Idle"),
             STREAM_STATUS_OFF: ("offline", "💤 Offline"),
