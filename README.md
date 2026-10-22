@@ -23,6 +23,9 @@ A desktop GUI for monitoring and auto-recording live streams from **Chaturbate, 
 - Auto-download protection: streams that repeatedly produce very short recordings get temporarily disabled, instead of thrashing in a start/stop loop
 - Multi-threaded design (Qt worker threads for status-checking, previews, and each active download) so the GUI never blocks
 - Per-stream Auto-start toggle, so already-known streams pick back up automatically next launch
+- Right-click stream rows for copy/open, start/stop download, and remove actions
+- Configurable filename templates with live preview and filename validation
+- Optional low-disk-space fallback destination for new downloads
 
 ---
 ## 📸 Preview
@@ -135,16 +138,20 @@ Everything setup-related lives in one dialog (click **⚙ Settings** in the tool
 
 Settings are organized into three tabs:
 
-**General** — output folder, auto-restart protections, and optional download bandwidth limiting.
+**General** — primary download folder, optional secondary location with a configurable minimum-free-space threshold, auto-restart protections, and optional download bandwidth limiting.
+
+When the primary drive has less than the configured free space (1–20 GB, default 5 GB), new downloads use the secondary folder if it is enabled, available, and has enough free space. If no suitable location is available, the download is not started and Stream Monitor warns you. Active recordings stay in their original folder; the primary destination is checked again independently for every new recording or split segment.
 
 **Browser & Cookies** — cookie source/browser selection, browser profile or cookies file, and User-Agent.
 
 **Recording** — maximum resolution and FPS (yt-dlp falls back gracefully through lower tiers if your exact preference isn't available), plus optional **Split by Filesize**. Choose 250 MB, 500 MB, 750 MB, 1 GB, 1.5 GB, 2 GB, 2.5GB or 3 GB per segment, then choose a mode:
 
-- **Split during recording** stops and finalizes each estimated-duration segment before starting the next. Segments are saved to the configured output folder with sequential numbers. A brief gap may occur between segments. For Stripchat, the first two-second media segment is used to estimate the live bitrate and calibrate the segment duration, rather than relying only on the bitrate table.
-- **Split after recording** records continuously, then uses FFmpeg to split the completed recording. This avoids restarting the stream download, but requires extra temporary disk space while the original and split files coexist. The original is removed only after multiple valid segment files have been created; otherwise it is kept.
+The **Filename template** field controls recording names and shows a live example with validity feedback. Supported fields are `{site}`, `{username}`, `{date}`, `{time}`, `{resolution}`, and `{fps}`. For example: `{site}-{username}`, `{username}_{date}`, `{username}_{date}_{fps}`, or `{site}-{username}-{time}_{resolution}`. Invalid fields and filenames are flagged and are not applied.
 
-Outside Stripchat's during-recording calibration, segment duration is estimated from the detected resolution/FPS and bitrate table, so actual file sizes may vary. File-size splitting requires FFmpeg. Leave splitting off to keep recordings continuous in a single file.
+- **Split during recording** downloads a short sample to measure the actual bytes per segment, calculates how many sample-sized segments fit the target, then stops and finalizes each estimated-duration segment before starting the next. Segments are saved to the configured output folder with sequential numbers. A brief gap may occur between segments. Stripchat measures its first two-second media segment directly.
+- **Split after recording** records continuously, then uses FFmpeg to split the completed recording into clips with a per-clip file-size limit. This avoids restarting the stream download, but requires extra temporary disk space while the original and split files coexist. Stream-copy cuts may vary slightly around keyframes. The original is removed only after multiple valid segment files have been created; otherwise it is kept.
+
+During-recording sample calibration and post-recording file-size limits keep clips near the selected size; actual sizes may vary with bitrate changes and keyframe boundaries. File-size splitting requires FFmpeg. Leave splitting off to keep recordings continuous in a single file.
 
 During-recording splits reuse the stream's detected resolution and FPS for later segments. The cached probe is cleared when the stream status changes, the stream ends, or you stop recording manually.
 
@@ -220,20 +227,3 @@ Downloads/
 
 * Some streams may appear "online" but still require authentication for download access — cookies fix this, see [Troubleshooting](#-troubleshooting) above
 * **Chromium-based browsers on Windows:** cookie access can be unreliable — see [Troubleshooting](#-troubleshooting) above for how to fix it.
-
----
-
-## 📝 Changelog
-
-### (August 2026)
-- `yt-dlp`/`ffmpeg` are now found automatically if installed inside this project's own venv, without needing that venv to be activated first — previously the app called them by bare name, which only ever resolved via system PATH regardless of what was actually pip-installed
-- Added a Settings dialog (download output, cookie source with a folder picker, User-Agent, video quality) — moved out of the cramped main toolbar, and every field now persists across restarts
-- Cookies are now always used (no more on/off toggle) — Chaturbate's access controls have tightened enough that this is effectively required anyway; you can still point at a custom Firefox-based browser profile (Floorp, Zen, LibreWolf, etc.) that isn't in the browser list
-- Fixed the stream table not stretching to fill the window width
-- Removed duplicated shutdown logic and debug logging left over from development, including a `libshiboken`/"already deleted" error that could print on close
-- Added user-agent support for macOS compatibility (improves compatibility with some platforms)
-- Improved filename format: `username YYYY-MM-DD HH_MM_SS.mp4` (includes seconds, so an auto-restart within the same minute as a previous recording ended doesn't collide with it and silently get skipped)
-- Added smart fallback for resolution selection when preferred formats are unavailable
-- Added adaptive stream checking: offline streams now use gradually longer check intervals to reduce unnecessary requests while still detecting new streams quickly
-- Added auto-download protection: streams that repeatedly produce very short downloads are temporarily disabled to prevent restart loops
-- Improved error handling and user feedback throughout the application

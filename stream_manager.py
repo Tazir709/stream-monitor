@@ -41,12 +41,14 @@ import subprocess
 import tempfile
 import time
 import threading
+import math
 import psutil
 import re
 import json
 import shutil
+import string
 from enum import Enum
-from typing import Optional, Dict
+from typing import Optional, Dict, Callable
 from datetime import datetime
 from queue import Queue, Empty
 from dataclasses import dataclass
@@ -58,7 +60,8 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QLabel, QPushButton, QLineEdit,
     QTextEdit, QCheckBox, QStatusBar, QMessageBox, QHeaderView,
     QSplitter, QDialog, QFileDialog, QComboBox,
-    QFormLayout, QDialogButtonBox, QSpinBox, QTabWidget, QScrollArea
+    QFormLayout, QDialogButtonBox, QSpinBox, QTabWidget, QScrollArea,
+    QMenu, QSlider
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QDir, QUrl
 from PySide6.QtGui import QImage, QPixmap, QColor, QDesktopServices
@@ -95,6 +98,10 @@ BROWSER_DISPLAY = ""  # "Floorp"/"Zen"/"LibreWolf" when a fork preset is active,
 COOKIES_FILE = ""  # optional exported-cookies.txt fallback for Chromium browsers on Windows
 USER_AGENT = ""
 DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the Settings dialog; persisted across sessions.
+SECONDARY_DOWNLOAD_ENABLED = False
+SECONDARY_DOWNLOAD_OUTPUT = ""
+MINIMUM_FREE_SPACE_GB = 5
+FILENAME_TEMPLATE = "{username} {date} {time}"
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
 SPLIT_BY_FILESIZE_ENABLED = False
@@ -105,11 +112,156 @@ _SPLIT_FILESIZE_MODES = {
     "Split after recording": "after",
 }
 
+_FILENAME_TEMPLATE_FIELDS = {
+    "site", "username", "date", "time", "resolution", "fps",
+}
+_INVALID_FILENAME_CHARACTERS = set('<>:"/\\|?*')
+
+
+def _format_filename_template(template: str, values: dict[str, str]) -> str:
+    """Format a filename stem using only the supported template fields."""
+    try:
+        for _, field_name, format_spec, conversion in string.Formatter().parse(template):
+            if field_name is None:
+                continue
+            if field_name not in _FILENAME_TEMPLATE_FIELDS or format_spec or conversion:
+                raise ValueError(f"Unsupported template field: {{{field_name}}}")
+        return template.format_map(values)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _filename_validation_error(filename: str) -> Optional[str]:
+    if not filename.strip():
+        return "The template produces an empty filename."
+    if len(filename) > 240:
+        return "The filename is too long (maximum 240 characters)."
+    if any(char in _INVALID_FILENAME_CHARACTERS or ord(char) < 32 for char in filename):
+        return 'The filename contains a character Windows does not allow: <>:"/\\|?*.'
+    if filename.endswith((" ", ".")):
+        return "A filename cannot end with a space or period."
+    device_name = filename.split(".", 1)[0].upper()
+    if device_name in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(
+        r"(COM|LPT)[1-9]", device_name
+    ):
+        return f'"{device_name}" is reserved by Windows.'
+    return None
+
+
+def _filename_template_preview(template: str) -> tuple[str, Optional[str]]:
+    now = datetime.now()
+    values = {
+        "site": "Stripchat",
+        "username": "sample_user",
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H-%M-%S"),
+        "resolution": "1920x1080",
+        "fps": "30",
+    }
+    try:
+        filename = _format_filename_template(template, values)
+    except ValueError as exc:
+        return "", str(exc)
+    return filename, _filename_validation_error(filename)
+
+
+def _build_download_filename_stem(
+    template: str,
+    url: str,
+    username: str,
+    started_at: datetime,
+    resolution: str,
+    fps: int,
+    segment_number: Optional[int] = None,
+) -> str:
+    values = {
+        "site": extract_site(url),
+        "username": username,
+        "date": started_at.strftime("%Y-%m-%d"),
+        "time": started_at.strftime("%H-%M-%S"),
+        "resolution": resolution or "unknown",
+        "fps": str(fps or 0),
+    }
+    for key, value in values.items():
+        values[key] = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).rstrip(" .")
+    filename = _format_filename_template(template, values)
+    if segment_number is not None:
+        filename += f" segment {segment_number:03d}"
+    error = _filename_validation_error(filename)
+    if error:
+        raise ValueError(f"Invalid filename template result: {error}")
+    return filename
+
+
 DOWNLOAD_BANDWIDTH_LIMIT_ENABLED = False
 DOWNLOAD_BANDWIDTH_ESTIMATED_MB_S = 0.0
 DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S = 0.0
 DOWNLOAD_BANDWIDTH_HEADROOM_MB_S = 0.25
 DOWNLOAD_BANDWIDTH_PERCENT = 80
+
+
+def select_download_output(
+    primary_folder: str,
+    secondary_enabled: bool,
+    secondary_folder: str,
+    minimum_free_space_gb: int,
+) -> tuple[Optional[str], Optional[str]]:
+    """Choose a destination with enough room, creating configured folders if needed."""
+    threshold_bytes = max(1, minimum_free_space_gb) * 1024 ** 3
+
+    def prepare(folder: str) -> tuple[Optional[str], Optional[str]]:
+        path = os.path.abspath(os.path.expanduser(folder.strip()))
+        try:
+            os.makedirs(path, exist_ok=True)
+            if not os.path.isdir(path):
+                return None, f"Destination is not a folder: {path}"
+            return path, None
+        except OSError as exc:
+            return None, f"Cannot access destination folder {path}: {exc}"
+
+    primary_path, primary_error = prepare(primary_folder or "Downloads")
+    if primary_error:
+        return None, primary_error
+    try:
+        primary_free = shutil.disk_usage(primary_path).free
+    except OSError as exc:
+        return None, f"Cannot check free space for primary destination {primary_path}: {exc}"
+    if primary_free >= threshold_bytes:
+        return primary_path, None
+
+    primary_free_gb = primary_free / 1024 ** 3
+    if not secondary_enabled:
+        return None, (
+            f"Primary download drive is low on space "
+            f"({primary_free_gb:.1f} GB free; threshold {minimum_free_space_gb} GB). "
+            "Enable and configure a secondary download location in Settings."
+        )
+    if not secondary_folder.strip():
+        return None, (
+            f"Primary download drive is low on space ({primary_free_gb:.1f} GB free), "
+            "and the secondary download folder is not configured."
+        )
+
+    secondary_path, secondary_error = prepare(secondary_folder)
+    if secondary_error:
+        return None, (
+            f"Primary download drive is low on space ({primary_free_gb:.1f} GB free). "
+            f"The secondary location is unavailable: {secondary_error}"
+        )
+    try:
+        secondary_free = shutil.disk_usage(secondary_path).free
+    except OSError as exc:
+        return None, (
+            f"Primary download drive is low on space ({primary_free_gb:.1f} GB free). "
+            f"Cannot check free space for secondary destination {secondary_path}: {exc}"
+        )
+    if secondary_free < threshold_bytes:
+        secondary_free_gb = secondary_free / 1024 ** 3
+        return None, (
+            f"Both download locations are low on space. Primary: {primary_free_gb:.1f} GB free; "
+            f"secondary: {secondary_free_gb:.1f} GB free; threshold: {minimum_free_space_gb} GB."
+        )
+    return secondary_path, None
 
 
 def format_speed_mb_s(value_mb_s: float) -> str:
@@ -205,6 +357,7 @@ KEYFRAME_SAFETY_FACTOR = 0.96
 BITRATE_SAFETY_FACTOR_SC = 1.12   # was 1.10
 KEYFRAME_SAFETY_FACTOR_SC = 0.96  # unchanged
 STRIPCHAT_60FPS_BITRATE_FACTOR = 1.05
+SPLIT_CALIBRATION_SIZE_FACTOR = 0.90
 
 
 def calculate_segment_duration_seconds(
@@ -869,6 +1022,7 @@ class DownloadWorker(QThread):
         self.stream_url  = stream_url
         self.username    = username
         self.output_path = os.path.join(output_path, username)
+        self.filename_template = FILENAME_TEMPLATE
         self.process: Optional[subprocess.Popen] = None
         self.is_running  = False
         self.manual_stop = False
@@ -888,6 +1042,7 @@ class DownloadWorker(QThread):
         self.cached_probe = cached_probe
         self.probe_cache_generation = probe_cache_generation
         self.target_duration_seconds = 0
+        self.target_segment_count = 0
         self.automatic_split = False
         self._expected_output_stem = ""
         os.makedirs(self.output_path, exist_ok=True)
@@ -918,7 +1073,7 @@ class DownloadWorker(QThread):
                 detected_fps,
             )
             self.resolution_signal.emit(self.stream_url, resolution, detected_fps)
-            if self.split_enabled:
+            if self.split_enabled and self.split_mode == "during":
                 self.target_duration_seconds = calculate_stream_segment_duration_seconds(
                     self.stream_url,
                     self.segment_size_mb,
@@ -928,19 +1083,36 @@ class DownloadWorker(QThread):
                 self.log_signal.emit(
                     self.username,
                     f"📦 {'Initial ' if self._during_split and STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(self.stream_url) else ''}"
-                    f"split target ({'during' if self.split_mode == 'during' else 'after'} recording): "
+                    "split target (during recording): "
                     f"{self.segment_size_mb} MB "
                     f"({self.target_duration_seconds}s at {resolution or MAX_DOWNLOAD_RESOLUTION}, "
                     f"{detected_fps} fps)",
                 )
                 if self._during_split:
                     return self.target_duration_seconds or None
+            elif self.split_enabled:
+                self.log_signal.emit(
+                    self.username,
+                    f"📦 Post-recording split size limit: {self.segment_size_mb} MB per clip",
+                )
             return None
 
         result = STRIPCHAT_ADAPTER.download(
             stream_url=self.stream_url,
             username=self.username,
             output_directory=self.output_path,
+            output_file_factory=lambda resolution, fps: os.path.join(
+                self.output_path,
+                _build_download_filename_stem(
+                    self.filename_template,
+                    self.stream_url,
+                    self.username,
+                    datetime.now(),
+                    resolution,
+                    fps,
+                    self.segment_number if self._during_split else None,
+                ) + ".mp4",
+            ),
             target_height=int(MAX_DOWNLOAD_RESOLUTION.split("x", 1)[1]),
             user_agent=USER_AGENT or None,
             ffmpeg_path=FFMPEG_PATH,
@@ -1033,7 +1205,7 @@ class DownloadWorker(QThread):
             if self.manual_stop:
                 return
             if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(self.stream_url):
-                if self.split_enabled:
+                if self.split_enabled and self.split_mode == "during":
                     self.target_duration_seconds = calculate_stream_segment_duration_seconds(
                         self.stream_url,
                         self.segment_size_mb,
@@ -1084,21 +1256,35 @@ class DownloadWorker(QThread):
                 )
                 self._last_detected_format = None
 
-            if self.split_enabled:
-                self.target_duration_seconds = calculate_stream_segment_duration_seconds(
-                    self.stream_url,
-                    self.segment_size_mb,
-                    res or MAX_DOWNLOAD_RESOLUTION,
-                    fps or MAX_DOWNLOAD_FPS,
-                )
-                if self.target_duration_seconds <= 0:
-                    raise RuntimeError("Unable to estimate a segment duration from the configured bitrate table")
+            if self.split_enabled and self.split_mode == "during":
+                if self._during_split:
+                    self.target_duration_seconds = self._calibrate_segment_duration(
+                        res or MAX_DOWNLOAD_RESOLUTION,
+                        fps or MAX_DOWNLOAD_FPS,
+                    )
+                    if self.manual_stop:
+                        return
+                else:
+                    self.target_duration_seconds = calculate_stream_segment_duration_seconds(
+                        self.stream_url,
+                        self.segment_size_mb,
+                        res or MAX_DOWNLOAD_RESOLUTION,
+                        fps or MAX_DOWNLOAD_FPS,
+                    )
+                    if self.target_duration_seconds <= 0:
+                        raise RuntimeError(
+                            "Unable to estimate a segment duration from the configured bitrate table"
+                        )
                 self.log_signal.emit(
                     self.username,
-                    f"📦 Split target ({'during' if self.split_mode == 'during' else 'after'} recording): "
-                    f"{self.segment_size_mb} MB "
-                    f"({self.target_duration_seconds}s at {res or MAX_DOWNLOAD_RESOLUTION}, "
-                    f"{fps or MAX_DOWNLOAD_FPS} fps)",
+                    f"📦 Split target (during recording): {self.segment_size_mb} MB "
+                    f"({self.target_duration_seconds}s at "
+                    f"{res or MAX_DOWNLOAD_RESOLUTION}, {fps or MAX_DOWNLOAD_FPS} fps)",
+                )
+            elif self.split_enabled:
+                self.log_signal.emit(
+                    self.username,
+                    f"📦 Post-recording split size limit: {self.segment_size_mb} MB per clip",
                 )
 
             if fps and fps > MAX_DOWNLOAD_FPS:
@@ -1110,13 +1296,15 @@ class DownloadWorker(QThread):
 
             self._started_at = time.time()
 
-            current_time = datetime.now().strftime(
-                "%Y-%m-%d %H_%M_%S_%f" if self.split_enabled
-                else "%Y-%m-%d %H_%M_%S"
+            filename_stem = _build_download_filename_stem(
+                self.filename_template,
+                self.stream_url,
+                self.username,
+                datetime.now(),
+                res or MAX_DOWNLOAD_RESOLUTION,
+                fps or MAX_DOWNLOAD_FPS,
+                self.segment_number if self._during_split else None,
             )
-            filename_stem = f"{self.username} {current_time}"
-            if self._during_split:
-                filename_stem += f" segment {self.segment_number:03d}"
             self._expected_output_stem = os.path.join(self.output_path, filename_stem)
             if self.manual_stop:
                 return
@@ -1279,6 +1467,101 @@ class DownloadWorker(QThread):
     def _has_nonempty_output(self) -> bool:
         return self._find_output_file() is not None
 
+    def _calibrate_segment_duration(self, resolution: str, fps: int) -> int:
+        """Measure a short live sample and estimate the size target from its bytes."""
+        sample_duration_seconds = 2
+        with tempfile.TemporaryDirectory(
+            prefix=".split-calibration-", dir=self.output_path
+        ) as sample_directory:
+            sample_template = os.path.join(sample_directory, "calibration.%(ext)s")
+            cmd = [
+                YTDLP_PATH,
+                "--no-simulate",
+                "--no-playlist",
+                "--format", get_download_format_selector(),
+                "--download-sections", f"*0-{sample_duration_seconds}",
+                "-o", sample_template,
+                "--no-overwrites", "--no-part",
+                "--skip-unavailable-fragments", "--hls-use-mpegts",
+                "--no-live-from-start",
+            ]
+            if DOWNLOAD_BANDWIDTH_LIMIT_ENABLED and DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S > 0:
+                need_mb_s = estimate_bandwidth_need_mb_s(resolution, fps)
+                if need_mb_s > 0:
+                    cmd.extend(["--limit-rate", f"{need_mb_s:.2f}M"])
+            user_agent = get_user_agent()
+            if user_agent:
+                cmd.extend(["--user-agent", user_agent])
+            cmd.extend(get_cookie_args())
+            cmd.extend(get_site_args(self.stream_url))
+            cmd.append(self.stream_url)
+
+            self.log_signal.emit(
+                self.username,
+                f"📦 Measuring a {sample_duration_seconds}s sample to calibrate "
+                "the split size…",
+            )
+            self._rate_limiter.wait_if_needed()
+            if self.manual_stop:
+                return 0
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                **_subprocess_kwargs(),
+            )
+            self.process = proc
+            try:
+                output, _ = proc.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                self._force_stop_process(proc)
+                proc.communicate()
+                if self.manual_stop:
+                    return 0
+                raise RuntimeError("Timed out while measuring the split-size sample")
+            finally:
+                if self.process is proc:
+                    self.process = None
+
+            if self.manual_stop:
+                return 0
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    "Could not download the split-size calibration sample: "
+                    f"{format_error_message(output or '')}"
+                )
+
+            sample_paths = [
+                os.path.join(sample_directory, name)
+                for name in os.listdir(sample_directory)
+                if not name.lower().endswith((".part", ".temp"))
+            ]
+            if not sample_paths:
+                raise RuntimeError("The split-size calibration produced no sample file")
+            sample_path = max(sample_paths, key=os.path.getsize)
+            sample_bytes = os.path.getsize(sample_path)
+            measured_duration = self._probe_file_duration(sample_path)
+            if sample_bytes <= 0 or measured_duration is None:
+                raise RuntimeError(
+                    "The split-size calibration sample was empty or had no readable duration"
+                )
+
+            target_bytes = self.segment_size_mb * 1024 * 1024
+            segment_count = max(
+                1,
+                int(SPLIT_CALIBRATION_SIZE_FACTOR * target_bytes / sample_bytes),
+            )
+            self.target_segment_count = segment_count
+            target_duration = max(1, math.ceil(segment_count * measured_duration))
+            self.log_signal.emit(
+                self.username,
+                f"📦 Calibrated from first sample ({measured_duration:.2f}s, "
+                f"{sample_bytes:,} bytes): targeting {segment_count} sample-sized "
+                f"segments ({target_duration}s) for {self.segment_size_mb} MB",
+            )
+            return target_duration
+
     def _find_output_file(self) -> Optional[str]:
         if not self._expected_output_stem:
             return None
@@ -1352,11 +1635,20 @@ class DownloadWorker(QThread):
                 "⚠ Could not split recording; keeping the original file",
             )
             return
-        if duration < max(1, self.target_duration_seconds - 2):
+        target_bytes = self.segment_size_mb * 1024 * 1024
+        try:
+            source_bytes = os.path.getsize(source_path)
+        except OSError as exc:
             self.log_signal.emit(
                 self.username,
-                f"📦 Recording is shorter than the estimated split target "
-                f"({duration:.1f}s of {self.target_duration_seconds}s); keeping one file",
+                f"⚠ Could not inspect recording size: {exc}; keeping the original file",
+            )
+            return
+        if source_bytes <= target_bytes:
+            self.log_signal.emit(
+                self.username,
+                f"📦 Recording is within the {self.segment_size_mb} MB size limit; "
+                "keeping one file",
             )
             return
         if not FFMPEG_PATH:
@@ -1373,33 +1665,85 @@ class DownloadWorker(QThread):
         if container not in ("mp4", "mkv", "webm", "mov", "ts"):
             container = "mp4"
         output_pattern = f"{source_stem} segment %03d.{container}"
-        self.log_signal.emit(self.username, "📦 Splitting finished recording with FFmpeg…")
+        self.log_signal.emit(
+            self.username,
+            f"📦 Splitting finished recording into {self.segment_size_mb} MB "
+            "size-limited clips with FFmpeg…",
+        )
         self.remuxing_signal.emit(self.stream_url, True)
+        source_duration = duration
+        offset = 0.0
+        segment_number = 1
+        split_error = ""
         try:
-            result = subprocess.run(
-                [
-                    FFMPEG_PATH,
-                    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", source_path,
-                    "-map", "0:v?", "-map", "0:a?",
-                    "-c", "copy",
-                    "-f", "segment",
-                    "-segment_time", str(self.target_duration_seconds),
-                    "-segment_start_number", "1",
-                    "-reset_timestamps", "1",
-                    "-segment_format", container,
-                    output_pattern,
-                ],
-                capture_output=True,
-                text=True,
-                **_subprocess_kwargs(),
-            )
+            while offset < source_duration - 0.25:
+                output_path = output_pattern.replace("%03d", f"{segment_number:03d}")
+                ffmpeg_size_limit = target_bytes
+                part_size = 0
+                for attempt in range(8):
+                    result = subprocess.run(
+                        [
+                            FFMPEG_PATH,
+                            "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                            "-ss", f"{offset:.3f}",
+                            "-i", source_path,
+                            "-map", "0:v?", "-map", "0:a?",
+                            "-c", "copy",
+                            "-fs", str(ffmpeg_size_limit),
+                            output_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        **_subprocess_kwargs(),
+                    )
+                    if result.returncode != 0:
+                        split_error = format_error_message(result.stderr, result.stdout)
+                        break
+
+                    part_size = (
+                        os.path.getsize(output_path)
+                        if os.path.exists(output_path)
+                        else 0
+                    )
+                    if 0 < part_size <= target_bytes:
+                        break
+
+                    if part_size == 0:
+                        split_error = "FFmpeg produced an empty clip"
+                        break
+                    if attempt == 7:
+                        split_error = (
+                            f"Could not keep clip under the {self.segment_size_mb} MB limit"
+                        )
+                        break
+
+                    overshoot = part_size - target_bytes
+                    reduction = max(1, target_bytes // 100)
+                    ffmpeg_size_limit = max(
+                        1,
+                        min(
+                            ffmpeg_size_limit - 1,
+                            ffmpeg_size_limit - overshoot - reduction,
+                        ),
+                    )
+                if split_error:
+                    break
+
+                part_duration = (
+                    self._probe_file_duration(output_path) if part_size > 0 else None
+                )
+                if part_duration is None:
+                    split_error = "FFmpeg produced an empty or unreadable clip"
+                    break
+
+                segment_number += 1
+                next_offset = offset + part_duration
+                if next_offset <= offset + 0.05:
+                    split_error = "FFmpeg produced a clip with no forward progress"
+                    break
+                offset = next_offset
         except OSError as exc:
-            self.log_signal.emit(
-                self.username,
-                f"❌ Could not run FFmpeg: {exc}; keeping the original recording",
-            )
-            return
+            split_error = f"Could not run FFmpeg: {exc}"
         finally:
             self.remuxing_signal.emit(self.stream_url, False)
 
@@ -1421,9 +1765,10 @@ class DownloadWorker(QThread):
             path for path in parts
             if os.path.isfile(path)
             and os.path.getsize(path) > 0
+            and os.path.getsize(path) <= target_bytes
             and self._probe_file_duration(path) is not None
         ]
-        if result.returncode != 0 or len(valid_parts) < 2 or len(valid_parts) != len(parts):
+        if split_error or len(valid_parts) < 2 or len(valid_parts) != len(parts):
             for path in parts:
                 try:
                     os.remove(path)
@@ -1432,9 +1777,7 @@ class DownloadWorker(QThread):
                         self.username,
                         f"⚠ Could not remove incomplete split output {os.path.basename(path)}: {exc}",
                     )
-            error = format_error_message(result.stderr, result.stdout) if result.returncode else (
-                "FFmpeg did not produce at least two valid segments"
-            )
+            error = split_error or "FFmpeg did not produce at least two valid segments"
             self.log_signal.emit(
                 self.username,
                 f"⚠ Post-recording split failed ({error}); keeping the original recording",
@@ -1788,6 +2131,10 @@ def save_streams(stream_items: dict) -> None:
         "settings": {
             "user_agent": USER_AGENT,
             "output_folder": DOWNLOAD_OUTPUT,
+            "secondary_download_enabled": SECONDARY_DOWNLOAD_ENABLED,
+            "secondary_output_folder": SECONDARY_DOWNLOAD_OUTPUT,
+            "minimum_free_space_gb": MINIMUM_FREE_SPACE_GB,
+            "filename_template": FILENAME_TEMPLATE,
             "max_resolution": MAX_DOWNLOAD_RESOLUTION,
             "max_fps": MAX_DOWNLOAD_FPS,
             "split_by_filesize": SPLIT_BY_FILESIZE_ENABLED,
@@ -2002,7 +2349,43 @@ class SettingsDialog(QDialog):
         out_row = QHBoxLayout()
         out_row.addWidget(self.out_input)
         out_row.addWidget(out_browse)
-        general_form.addRow("Download output:", out_row)
+        general_form.addRow("Primary download folder:", out_row)
+
+        self.secondary_download_check = QCheckBox("Enable secondary download location")
+        general_form.addRow("", self.secondary_download_check)
+        self.secondary_download_hint = QLabel(
+            "When enabled, new recordings use this folder if the primary drive "
+            "falls below the minimum free-space threshold. Existing recordings "
+            "stay where they started; each new recording or split segment checks "
+            "available space again. A download will not start if neither location "
+            "has enough free space."
+        )
+        self.secondary_download_hint.setWordWrap(True)
+        self.secondary_download_hint.setStyleSheet("color: #888; font-size: 11px;")
+        general_form.addRow("", self.secondary_download_hint)
+
+        self.secondary_out_input = QLineEdit(SECONDARY_DOWNLOAD_OUTPUT)
+        self.secondary_out_input.setToolTip(
+            "New downloads use this folder when the primary drive is below the free-space threshold"
+        )
+        self.secondary_out_browse = QPushButton("Browse…")
+        self.secondary_out_browse.clicked.connect(self._browse_secondary_output)
+        secondary_out_row = QHBoxLayout()
+        secondary_out_row.addWidget(self.secondary_out_input)
+        secondary_out_row.addWidget(self.secondary_out_browse)
+        self.secondary_out_label = QLabel("Secondary download folder:")
+        general_form.addRow(self.secondary_out_label, secondary_out_row)
+
+        self.minimum_free_space_slider = QSlider(Qt.Horizontal)
+        self.minimum_free_space_slider.setRange(1, 20)
+        self.minimum_free_space_slider.setTickInterval(1)
+        self.minimum_free_space_slider.setTickPosition(QSlider.TicksBelow)
+        self.minimum_free_space_label = QLabel()
+        minimum_space_row = QHBoxLayout()
+        minimum_space_row.addWidget(self.minimum_free_space_slider, 1)
+        minimum_space_row.addWidget(self.minimum_free_space_label)
+        self.minimum_free_space_form_label = QLabel("Minimum free space:")
+        general_form.addRow(self.minimum_free_space_form_label, minimum_space_row)
 
         # ── Video quality ──
         self.resolution_combo = QComboBox()
@@ -2016,6 +2399,21 @@ class SettingsDialog(QDialog):
         quality_row.addWidget(QLabel("fps max"))
         quality_row.addStretch(1)
         recording_form.addRow("Video quality:", quality_row)
+
+        self.filename_template_input = QLineEdit(FILENAME_TEMPLATE)
+        self.filename_template_input.setPlaceholderText("{username} {date} {time}")
+        recording_form.addRow("Filename template:", self.filename_template_input)
+        filename_tokens = QLabel(
+            "Available: {site}, {username}, {date}, {time}, {resolution}, {fps}\n"
+            "Examples: {site}-{username}, {username}_{date}, "
+            "{username}_{date}_{fps}, {site}-{username}-{time}_{resolution}"
+        )
+        filename_tokens.setWordWrap(True)
+        filename_tokens.setStyleSheet("color: #888; font-size: 11px;")
+        recording_form.addRow("", filename_tokens)
+        self.filename_preview_label = QLabel()
+        self.filename_preview_label.setWordWrap(True)
+        recording_form.addRow("Preview:", self.filename_preview_label)
 
         self.split_enabled_check = QCheckBox("Split recordings by file size")
         self.split_mode_combo = QComboBox()
@@ -2203,6 +2601,10 @@ class SettingsDialog(QDialog):
 
         # Live-apply on change, same pattern the rest of the app already uses
         self.out_input.textChanged.connect(self._on_output_changed)
+        self.secondary_download_check.toggled.connect(self._on_secondary_download_toggled)
+        self.secondary_out_input.textChanged.connect(self._on_secondary_output_changed)
+        self.minimum_free_space_slider.valueChanged.connect(self._on_minimum_free_space_changed)
+        self.filename_template_input.textChanged.connect(self._on_filename_template_changed)
         self.resolution_combo.currentTextChanged.connect(self._on_resolution_changed)
         self.fps_combo.currentTextChanged.connect(self._on_fps_changed)
         self.split_enabled_check.toggled.connect(self._on_split_enabled_changed)
@@ -2224,6 +2626,12 @@ class SettingsDialog(QDialog):
 
     def _load_from_globals(self):
         self.out_input.setText(DOWNLOAD_OUTPUT)
+        self.secondary_download_check.setChecked(SECONDARY_DOWNLOAD_ENABLED)
+        self.secondary_out_input.setText(SECONDARY_DOWNLOAD_OUTPUT)
+        self.minimum_free_space_slider.setValue(MINIMUM_FREE_SPACE_GB)
+        self._update_secondary_download_controls()
+        self.filename_template_input.setText(FILENAME_TEMPLATE)
+        self._update_filename_template_preview()
         if MAX_DOWNLOAD_RESOLUTION in _RESOLUTION_CHOICES:
             self.resolution_combo.setCurrentText(MAX_DOWNLOAD_RESOLUTION)
         if str(MAX_DOWNLOAD_FPS) in _FPS_CHOICES:
@@ -2289,6 +2697,64 @@ class SettingsDialog(QDialog):
         global DOWNLOAD_OUTPUT
         DOWNLOAD_OUTPUT = text.strip() or "Downloads"
         self.settings_changed.emit()
+
+    def _update_secondary_download_controls(self):
+        enabled = self.secondary_download_check.isChecked()
+        self.secondary_out_input.setVisible(enabled)
+        self.secondary_out_browse.setVisible(enabled)
+        self.secondary_out_label.setVisible(enabled)
+        self.minimum_free_space_slider.setVisible(enabled)
+        self.minimum_free_space_label.setVisible(enabled)
+        self.minimum_free_space_form_label.setVisible(enabled)
+        self.minimum_free_space_label.setText(
+            f"{self.minimum_free_space_slider.value()} GB"
+        )
+
+    def _on_secondary_download_toggled(self, enabled: bool):
+        global SECONDARY_DOWNLOAD_ENABLED
+        SECONDARY_DOWNLOAD_ENABLED = bool(enabled)
+        self._update_secondary_download_controls()
+        self.settings_changed.emit()
+
+    def _on_secondary_output_changed(self, text: str):
+        global SECONDARY_DOWNLOAD_OUTPUT
+        SECONDARY_DOWNLOAD_OUTPUT = text.strip()
+        self.settings_changed.emit()
+
+    def _on_minimum_free_space_changed(self, value: int):
+        global MINIMUM_FREE_SPACE_GB
+        MINIMUM_FREE_SPACE_GB = int(value)
+        self._update_secondary_download_controls()
+        self.settings_changed.emit()
+
+    def _browse_secondary_output(self):
+        folder = QFileDialog.getExistingDirectory(
+            None,
+            "Choose secondary download folder",
+            self.secondary_out_input.text() or ".",
+        )
+        if folder:
+            self.secondary_out_input.setText(folder)
+
+    def _on_filename_template_changed(self, template: str):
+        global FILENAME_TEMPLATE
+        self._update_filename_template_preview(template)
+        _, error = _filename_template_preview(template)
+        if error:
+            return
+        FILENAME_TEMPLATE = template
+        self.settings_changed.emit()
+
+    def _update_filename_template_preview(self, template: Optional[str] = None):
+        preview, error = _filename_template_preview(
+            self.filename_template_input.text() if template is None else template
+        )
+        if error:
+            self.filename_preview_label.setText(f"Invalid filename template: {error}")
+            self.filename_preview_label.setStyleSheet("color: #ff8a80; font-size: 11px;")
+        else:
+            self.filename_preview_label.setText(f"{preview}.mp4 — valid filename")
+            self.filename_preview_label.setStyleSheet("color: #7ae8a6; font-size: 11px;")
 
     def _on_resolution_changed(self, text: str):
         global MAX_DOWNLOAD_RESOLUTION
@@ -2687,6 +3153,8 @@ class StreamDownloaderGUI(QMainWindow):
     # ── Persistence ─────────────────────────────
 
     def _load_saved_streams(self):
+        global SECONDARY_DOWNLOAD_ENABLED, SECONDARY_DOWNLOAD_OUTPUT
+        global MINIMUM_FREE_SPACE_GB
         saved = load_saved_streams()
         if not saved:
             return
@@ -2708,6 +3176,38 @@ class StreamDownloaderGUI(QMainWindow):
             DOWNLOAD_OUTPUT = saved_output
             if self._out_input:
                 self._out_input.setText(DOWNLOAD_OUTPUT)
+
+        saved_secondary_enabled = settings.get("secondary_download_enabled")
+        if isinstance(saved_secondary_enabled, bool):
+            SECONDARY_DOWNLOAD_ENABLED = saved_secondary_enabled
+            self._settings_dialog.secondary_download_check.setChecked(
+                SECONDARY_DOWNLOAD_ENABLED
+            )
+        saved_secondary_output = settings.get("secondary_output_folder")
+        if isinstance(saved_secondary_output, str):
+            SECONDARY_DOWNLOAD_OUTPUT = saved_secondary_output
+            self._settings_dialog.secondary_out_input.setText(
+                SECONDARY_DOWNLOAD_OUTPUT
+            )
+        saved_minimum_free_space = settings.get("minimum_free_space_gb")
+        try:
+            saved_minimum_free_space = int(saved_minimum_free_space)
+        except (TypeError, ValueError):
+            saved_minimum_free_space = MINIMUM_FREE_SPACE_GB
+        if 1 <= saved_minimum_free_space <= 20:
+            MINIMUM_FREE_SPACE_GB = saved_minimum_free_space
+            self._settings_dialog.minimum_free_space_slider.setValue(
+                MINIMUM_FREE_SPACE_GB
+            )
+            self._settings_dialog._update_secondary_download_controls()
+
+        saved_filename_template = settings.get("filename_template")
+        if isinstance(saved_filename_template, str):
+            _, template_error = _filename_template_preview(saved_filename_template)
+            if not template_error:
+                global FILENAME_TEMPLATE
+                FILENAME_TEMPLATE = saved_filename_template
+                self._settings_dialog.filename_template_input.setText(FILENAME_TEMPLATE)
 
         saved_resolution = str(settings.get("max_resolution", "") or "").strip()
         if saved_resolution in _RESOLUTION_CHOICES:
@@ -3006,6 +3506,8 @@ class StreamDownloaderGUI(QMainWindow):
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.setShowGrid(False)
+        self._table.viewport().setContextMenuPolicy(Qt.DefaultContextMenu)
+        self._table.viewport().installEventFilter(self)
         splitter.addWidget(self._table)
 
         # Log panel
@@ -3155,6 +3657,12 @@ class StreamDownloaderGUI(QMainWindow):
         rm_btn.clicked.connect(lambda _, u=url: self._remove_stream(u))
         self._table.setCellWidget(row, 11, rm_btn)
 
+        for widget in (
+            thumb, site_lbl, status_lbl, dur, res_lbl, fps_lbl,
+            auto_cb, cb_wrap, dl_lbl, start_btn, stop_btn, rm_btn,
+        ):
+            self._set_stream_context_menu(widget, url)
+
         self.checker.add_stream(url, force=True)
         self._log_msg(f"➕ Added {username}", "#4CAF50")
         self._save()
@@ -3180,7 +3688,61 @@ class StreamDownloaderGUI(QMainWindow):
             if item.current_status == StreamStatus.ONLINE and not item.download_active:
                 self._manual_start(url)
 
-    def _manual_start(self, url: str):
+    def _set_stream_context_menu(self, widget: QWidget, url: str):
+        pending = [widget]
+        while pending:
+            target = pending.pop()
+            target.setProperty("streamContextUrl", url)
+            target.setContextMenuPolicy(Qt.DefaultContextMenu)
+            target.installEventFilter(self)
+            pending.extend(
+                target.findChildren(
+                    QWidget,
+                    options=Qt.FindChildOption.FindDirectChildrenOnly,
+                )
+            )
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.ContextMenu:
+            if watched is self._table.viewport():
+                row = self._table.rowAt(event.pos().y())
+                for item in self.stream_items.values():
+                    if item.row == row:
+                        self._show_stream_context_menu(item.url, event.globalPos())
+                        return True
+                return row >= 0
+            target = watched if isinstance(watched, QWidget) else None
+            while target:
+                url = target.property("streamContextUrl")
+                if url:
+                    self._show_stream_context_menu(url, event.globalPos())
+                    return True
+                target = target.parentWidget()
+        return super().eventFilter(watched, event)
+
+    def _show_stream_context_menu(self, url: str, global_position):
+        item = self.stream_items.get(url)
+        if not item:
+            return
+        menu = QMenu(self)
+        menu.addAction("Copy username", lambda: QApplication.clipboard().setText(item.username))
+        menu.addAction("Copy URL", lambda: QApplication.clipboard().setText(url))
+        menu.addAction("Open in browser", lambda: self._open_stream_in_browser(url))
+        menu.addSeparator()
+        worker = self.download_workers.get(url)
+        is_downloading = item.download_active or bool(worker and worker.isRunning())
+        if is_downloading:
+            menu.addAction("Stop download", lambda: self._stop_download(url))
+        else:
+            menu.addAction("Start download", lambda: self._manual_start(url))
+        menu.addAction("Remove stream", lambda: self._remove_stream(url))
+        menu.exec(global_position)
+
+    def _open_stream_in_browser(self, url: str):
+        if not QDesktopServices.openUrl(QUrl(url)):
+            QMessageBox.warning(self, "Unable to Open URL", f"Could not open this URL:\n{url}")
+
+    def _manual_start(self, url: str, show_space_warning: bool = True):
         worker = self.download_workers.get(url)
         if worker and worker.isRunning():
             self._log_msg(f"⚠ Already downloading {self.stream_items[url].username}", "#FF9800")
@@ -3210,6 +3772,27 @@ class StreamDownloaderGUI(QMainWindow):
                 return
             item.queued = False
 
+        output_folder, space_error = select_download_output(
+            self._out_input.text().strip() or "Downloads",
+            SECONDARY_DOWNLOAD_ENABLED,
+            SECONDARY_DOWNLOAD_OUTPUT,
+            MINIMUM_FREE_SPACE_GB,
+        )
+        if space_error:
+            self._log_msg(f"⚠ Download not started for {item.username}: {space_error}", "#F44336")
+            self._status_bar.showMessage(space_error, 15000)
+            if show_space_warning:
+                QMessageBox.warning(self, "Insufficient Download Space", space_error)
+            return
+        if output_folder != os.path.abspath(
+            os.path.expanduser(self._out_input.text().strip() or "Downloads")
+        ):
+            self._log_msg(
+                f"💾 Primary drive is below {MINIMUM_FREE_SPACE_GB} GB free; "
+                f"using secondary location for {item.username}",
+                "#FF9800",
+            )
+
         segment_number = None
         during_split_enabled = (
             SPLIT_BY_FILESIZE_ENABLED and SPLIT_FILESIZE_MODE == "during"
@@ -3224,7 +3807,7 @@ class StreamDownloaderGUI(QMainWindow):
         worker = DownloadWorker(
             url,
             item.username,
-            self._out_input.text().strip() or "Downloads",
+            output_folder,
             segment_number=segment_number,
             cached_probe=cached_probe,
             probe_cache_generation=self._probe_cache_generation.get(url, 0),
@@ -3379,7 +3962,7 @@ class StreamDownloaderGUI(QMainWindow):
         # Auto-start / force-stop logic
         if status == StreamStatus.ONLINE and item.auto_start and not item.download_active:
             self._log_msg(f"🎬 Auto-start: {item.username}", "#4CAF50")
-            self._manual_start(url)
+            self._manual_start(url, show_space_warning=False)
         elif status in (StreamStatus.OFFLINE, StreamStatus.PRIVATE, StreamStatus.AWAY):
             self.split_sessions.pop(url, None)
             if item.queued:
@@ -3538,7 +4121,7 @@ class StreamDownloaderGUI(QMainWindow):
                     f"for {item.username}",
                     "#4CAF50",
                 )
-                self._manual_start(url)
+                self._manual_start(url, show_space_warning=False)
             else:
                 self.split_sessions.pop(url, None)
                 self._log_msg(
@@ -3643,7 +4226,7 @@ class StreamDownloaderGUI(QMainWindow):
                 if current_need + self._stream_need_mb_s(item) <= queue_limit:
                     item.queued = False
                     self._log_msg(f"▶ Resuming queued stream: {item.username}", "#4CAF50")
-                    self._manual_start(url)
+                    self._manual_start(url, show_space_warning=False)
                     return
 
     def _estimate_download_info(self) -> tuple[str, float, float]:
