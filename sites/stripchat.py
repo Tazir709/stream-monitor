@@ -1048,6 +1048,7 @@ class StripchatSiteAdapter:
         output_directory: str,
         target_height: int,
         user_agent: Optional[str],
+        output_file_factory: Optional[Callable[[str, int], str]] = None,
         ffmpeg_path: str = "ffmpeg",
         on_log: Optional[Callable[[str], None]] = None,
         on_progress: Optional[Callable[[int], None]] = None,
@@ -1068,6 +1069,7 @@ class StripchatSiteAdapter:
         if segment_number is not None:
             output_stem += f" segment {segment_number:03d}"
         output_file = os.path.join(output_directory, f"{output_stem}.mp4")
+        output_resolution, output_fps = "unknown", 0
         effective_max_duration_seconds = max_duration_seconds
         try:
             info = get_stream_info(
@@ -1075,15 +1077,19 @@ class StripchatSiteAdapter:
                 target_height=target_height,
                 user_agent=user_agent or None,
             )
+            output_resolution = f"{info.width}x{info.height}"
+            output_fps = int(round(info.fps or 0))
             if info and on_resolution:
                 probed_duration = on_resolution(
-                    f"{info.width}x{info.height}", int(round(info.fps or 0))
+                    output_resolution, output_fps
                 )
                 if probed_duration and probed_duration > 0:
                     effective_max_duration_seconds = probed_duration
         except Exception as exc:
             if on_log:
                 on_log(f"Resolution probe failed: {exc}")
+        if output_file_factory:
+            output_file = output_file_factory(output_resolution, output_fps)
 
         request = DownloadRequest(
             stream_url=stream_url,
