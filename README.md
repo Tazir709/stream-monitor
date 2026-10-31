@@ -32,22 +32,32 @@ A desktop GUI for monitoring and automatically recording live streams from multi
 
 **Requirements:** Python 3.10+, FFmpeg available on your `PATH`, and an internet connection.
 
-1. Install Python and FFmpeg:
-   - Windows: install Python from [python.org](https://www.python.org/downloads/) and FFmpeg with `winget install ffmpeg`.
-   - macOS: `brew install python ffmpeg`
-   - Ubuntu/Debian: `sudo apt install python3 python3-venv ffmpeg`
-   - Fedora: `sudo dnf install python3 ffmpeg`
-   - Arch Linux: `sudo pacman -S python python-pip python-venv ffmpeg`
-2. Clone the repository and run the setup script:
+### 1. Install Python and FFmpeg
 
-   ```bash
-   git clone https://github.com/Tazir709/stream-monitor.git
-   cd stream-monitor
-   ```
+- **Windows:** Install [Python](https://www.python.org/downloads/) and FFmpeg using `winget install ffmpeg`.
+- **macOS:** `brew install python ffmpeg`
+- **Ubuntu/Debian:** `sudo apt install python3 python3-venv ffmpeg`
+- **Fedora:** `sudo dnf install python3 ffmpeg`
+- **Arch Linux:** `sudo pacman -S python python-pip python-venv ffmpeg`
 
-   **Windows** — run `setup_windows.bat`.
+### 2. Download Stream Monitor
 
-   **macOS/Linux** — run `chmod +x setup.sh && ./setup.sh`.
+Choose either method:
+
+- **Download ZIP:** Download the latest release ZIP from the [Releases page](https://github.com/Tazir709/stream-monitor/releases) and extract it.
+- **Clone with Git:**
+
+  ```bash
+  git clone https://github.com/Tazir709/stream-monitor.git
+  cd stream-monitor
+  ```
+
+### 3. Run the setup script
+
+Open the extracted or cloned `stream-monitor` folder.
+
+- **Windows:** Run `setup_windows.bat`, then `launch.bat` to start Stream Monitor.
+- **macOS/Linux:** Run `chmod +x setup.sh && ./setup.sh`, then follow the launch instructions below.
 
 The setup script creates `Stream_Venv` and installs the Python dependencies. FFmpeg must be installed separately as a system application.
 
