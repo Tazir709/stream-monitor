@@ -20,10 +20,13 @@ IS_WINDOWS = sys.platform.startswith("win")
 _script_dir = Path(__file__).resolve().parent
 _venv_dir = _script_dir / "Stream_Venv"
 if IS_WINDOWS:
-    _target_python = _venv_dir / "Scripts" / "pythonw.exe"
-    if not _target_python.exists():
-        _target_python = _venv_dir / "Scripts" / "python.exe"
-    _already_there = Path(sys.executable).resolve() == _target_python.resolve()
+    _venv_python = _venv_dir / "Scripts" / "python.exe"
+    _venv_pythonw = _venv_dir / "Scripts" / "pythonw.exe"
+    _target_python = _venv_pythonw if _venv_pythonw.exists() else _venv_python
+    _already_there = Path(sys.executable).resolve() in {
+        _venv_python.resolve(),
+        _venv_pythonw.resolve(),
+    }
 else:
     _target_python = _venv_dir / "bin" / "python3"
     _already_there = Path(sys.prefix).resolve() == _venv_dir.resolve()
@@ -63,7 +66,7 @@ from PySide6.QtWidgets import (
     QFormLayout, QDialogButtonBox, QSpinBox, QTabWidget, QScrollArea,
     QMenu, QSlider
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QDir, QUrl
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QDir, QUrl, QObject
 from PySide6.QtGui import QImage, QPixmap, QColor, QDesktopServices
 from sites import (
     check_args_for_url,
@@ -75,6 +78,12 @@ from sites import (
     referer_for_url,
     requires_authentication,
     SiteCheckContext,
+    get_site_policy,
+    hostname_from_url,
+)
+from sites.xlovecam import (
+    XloveCamSiteAdapter,
+    username_from_url as xlovecam_username_from_url,
 )
 
 try:
@@ -87,6 +96,7 @@ except ImportError:  # pragma: no cover - used when the helper module is unavail
     FFMPEG_HAS_NATIVE_H264_DECODER = False
 
 STRIPCHAT_ADAPTER = StripchatSiteAdapter() if StripchatSiteAdapter else None
+XLOVECAM_ADAPTER = XloveCamSiteAdapter()
 
 
 # ─────────────────────────────────────────────
@@ -101,7 +111,8 @@ DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the
 SECONDARY_DOWNLOAD_ENABLED = False
 SECONDARY_DOWNLOAD_OUTPUT = ""
 MINIMUM_FREE_SPACE_GB = 5
-FILENAME_TEMPLATE = "{username} {date} {time}"
+FILENAME_TEMPLATE = "{username}/{username} {date} {time}"
+_LEGACY_DEFAULT_FILENAME_TEMPLATE = "{username} {date} {time}"
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
 SPLIT_BY_FILESIZE_ENABLED = False
@@ -119,7 +130,7 @@ _INVALID_FILENAME_CHARACTERS = set('<>:"/\\|?*')
 
 
 def _format_filename_template(template: str, values: dict[str, str]) -> str:
-    """Format a filename stem using only the supported template fields."""
+    """Format a relative output path using only the supported template fields."""
     try:
         for _, field_name, format_spec, conversion in string.Formatter().parse(template):
             if field_name is None:
@@ -135,16 +146,24 @@ def _filename_validation_error(filename: str) -> Optional[str]:
     if not filename.strip():
         return "The template produces an empty filename."
     if len(filename) > 240:
-        return "The filename is too long (maximum 240 characters)."
-    if any(char in _INVALID_FILENAME_CHARACTERS or ord(char) < 32 for char in filename):
-        return 'The filename contains a character Windows does not allow: <>:"/\\|?*.'
-    if filename.endswith((" ", ".")):
-        return "A filename cannot end with a space or period."
-    device_name = filename.split(".", 1)[0].upper()
-    if device_name in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(
-        r"(COM|LPT)[1-9]", device_name
-    ):
-        return f'"{device_name}" is reserved by Windows.'
+        return "The filename and folders are too long (maximum 240 characters)."
+    if "\\" in filename:
+        return "Use forward slashes (/) to separate folders in the template."
+    components = filename.split("/")
+    if any(not component for component in components):
+        return "Folder names and the filename cannot be empty."
+    for component in components:
+        if component in (".", ".."):
+            return "Folder paths cannot contain '.' or '..' components."
+        if any(char in _INVALID_FILENAME_CHARACTERS or ord(char) < 32 for char in component):
+            return 'A folder or filename contains a character Windows does not allow: <>:"\\|?*.'
+        if component.endswith((" ", ".")):
+            return "A folder or filename cannot end with a space or period."
+        device_name = component.split(".", 1)[0].upper()
+        if device_name in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(
+            r"(COM|LPT)[1-9]", device_name
+        ):
+            return f'"{device_name}" is reserved by Windows.'
     return None
 
 
@@ -653,6 +672,13 @@ def extract_site(url: str) -> str:
     return display_name_for_url(url)
 
 
+def extract_stream_username(url: str) -> str:
+    """Extract the site-specific model name used for labels and output paths."""
+    if XLOVECAM_ADAPTER.matches(url):
+        return xlovecam_username_from_url(url)
+    return extract_username(url)
+
+
 def log_exception(prefix: str) -> None:
     print(f"[Debug] {prefix}")
     traceback.print_exc()
@@ -863,6 +889,29 @@ class SharedPreviewWorker(QThread):
                 print(f"[Debug] Stripchat preview produced null pixmap for {page_url}")
             except Exception as e:
                 print(f"[Debug] Stripchat preview QImage conversion failed for {page_url}: {e!r}")
+            return
+
+        if XLOVECAM_ADAPTER.matches(page_url):
+            try:
+                frame_data = XLOVECAM_ADAPTER.preview_data(
+                    page_url,
+                    user_agent=get_user_agent(),
+                    ffmpeg_path=FFMPEG_PATH,
+                    subprocess_kwargs=_subprocess_kwargs(),
+                )
+                if frame_data:
+                    image_bytes, width, height = frame_data
+                    img = QImage(
+                        image_bytes, width, height, width * 3, QImage.Format_RGB888
+                    )
+                    pixmap = QPixmap.fromImage(img)
+                    if not pixmap.isNull():
+                        self._pixmap_cache[page_url] = pixmap
+                        self.preview_updated.emit(page_url, pixmap)
+                        return
+                print(f"[Debug] XloveCam preview unavailable for {page_url}")
+            except Exception as exc:
+                print(f"[Debug] XloveCam preview failed for {page_url}: {exc!r}")
             return
 
         stream_url = self._get_stream_url(page_url)
@@ -1097,11 +1146,8 @@ class DownloadWorker(QThread):
                 )
             return None
 
-        result = STRIPCHAT_ADAPTER.download(
-            stream_url=self.stream_url,
-            username=self.username,
-            output_directory=self.output_path,
-            output_file_factory=lambda resolution, fps: os.path.join(
+        def make_stripchat_output_file(resolution: str, fps: int) -> str:
+            path = os.path.join(
                 self.output_path,
                 _build_download_filename_stem(
                     self.filename_template,
@@ -1112,7 +1158,15 @@ class DownloadWorker(QThread):
                     fps,
                     self.segment_number if self._during_split else None,
                 ) + ".mp4",
-            ),
+            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            return path
+
+        result = STRIPCHAT_ADAPTER.download(
+            stream_url=self.stream_url,
+            username=self.username,
+            output_directory=self.output_path,
+            output_file_factory=make_stripchat_output_file,
             target_height=int(MAX_DOWNLOAD_RESOLUTION.split("x", 1)[1]),
             user_agent=USER_AGENT or None,
             ffmpeg_path=FFMPEG_PATH,
@@ -1142,6 +1196,108 @@ class DownloadWorker(QThread):
             and result.status in ("success", "stopped")
         ):
             self._post_recording_split(result.output_file)
+        return True
+
+    def _run_xlovecam_download(self) -> bool:
+        """Record XloveCam's native HLS playlist through FFmpeg."""
+        if not XLOVECAM_ADAPTER.matches(self.stream_url):
+            return False
+
+        self.is_running = True
+        self._xlovecam_stop = False
+        self._started_at = time.time()
+        max_duration_seconds = 0
+        if self.split_enabled and self.split_mode == "during":
+            max_duration_seconds = calculate_stream_segment_duration_seconds(
+                self.stream_url,
+                self.segment_size_mb,
+                MAX_DOWNLOAD_RESOLUTION,
+                MAX_DOWNLOAD_FPS,
+            )
+            self.log_signal.emit(
+                self.username,
+                f"📦 XloveCam split target: {self.segment_size_mb} MB "
+                f"(estimated {max_duration_seconds}s)",
+            )
+        elif self.split_enabled:
+            self.log_signal.emit(
+                self.username,
+                f"📦 Post-recording split size limit: {self.segment_size_mb} MB per clip",
+            )
+
+        def report_resolution(resolution: str, fps: int) -> None:
+            self._last_detected_format = (resolution, fps)
+            self.resolution_signal.emit(self.stream_url, resolution, fps)
+            self.log_signal.emit(
+                self.username,
+                f"📐 XloveCam stream format: {resolution} ({fps} fps)",
+            )
+
+        def wrapped_log(message: str) -> None:
+            if "Remuxing with FFmpeg" in message:
+                self.remuxing_signal.emit(self.stream_url, True)
+            elif "Remuxed to:" in message:
+                self.remuxing_signal.emit(self.stream_url, False)
+            self.log_signal.emit(self.username, message)
+
+        output_file = os.path.join(
+            self.output_path,
+            _build_download_filename_stem(
+                self.filename_template,
+                self.stream_url,
+                self.username,
+                datetime.now(),
+                "unknown",
+                0,
+                self.segment_number if self._during_split else None,
+            ) + ".mp4",
+        )
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        self.resolution_signal.emit(self.stream_url, "", 0)
+        if self.manual_stop:
+            self.is_running = False
+            return True
+
+        result = XLOVECAM_ADAPTER.download(
+            stream_url=self.stream_url,
+            output_file=output_file,
+            user_agent=get_user_agent() or None,
+            ffmpeg_path=FFMPEG_PATH,
+            on_log=wrapped_log,
+            should_stop=lambda: self.manual_stop or self._xlovecam_stop,
+            max_duration_seconds=max_duration_seconds,
+            subprocess_kwargs=_subprocess_kwargs(),
+            on_resolution=report_resolution,
+        )
+        self.remuxing_signal.emit(self.stream_url, False)
+        output_exists = bool(
+            result.output_file
+            and os.path.isfile(result.output_file)
+            and os.path.getsize(result.output_file) > 0
+        )
+        self.automatic_split = (
+            result.split_requested and output_exists and not self.manual_stop
+        )
+        if result.status == "error":
+            self.log_signal.emit(self.username, f"❌ XloveCam: {result.message}")
+        elif result.status == "success":
+            self.log_signal.emit(self.username, "✓ XloveCam recording completed")
+            elapsed = int(time.time() - self._started_at)
+            if not self.automatic_split and elapsed < AUTO_DOWNLOAD_DISABLE_SECONDS:
+                self.short_download_signal.emit(self.stream_url, elapsed)
+        elif result.status == "stopped":
+            self.log_signal.emit(self.username, "⏹ XloveCam recording stopped")
+
+        if (
+            self.split_enabled
+            and self.split_mode == "after"
+            and output_exists
+            and result.output_file
+            and result.status in ("success", "stopped")
+        ):
+            self._post_recording_split(result.output_file)
+        self._xlovecam_stop = False
+        self.is_running = False
         return True
 
     def _probe_resolution(self) -> tuple[str, int]:
@@ -1203,6 +1359,8 @@ class DownloadWorker(QThread):
         self.is_running = True
         try:
             if self.manual_stop:
+                return
+            if self._run_xlovecam_download():
                 return
             if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(self.stream_url):
                 if self.split_enabled and self.split_mode == "during":
@@ -1306,6 +1464,7 @@ class DownloadWorker(QThread):
                 self.segment_number if self._during_split else None,
             )
             self._expected_output_stem = os.path.join(self.output_path, filename_stem)
+            os.makedirs(os.path.dirname(self._expected_output_stem), exist_ok=True)
             if self.manual_stop:
                 return
 
@@ -1565,8 +1724,9 @@ class DownloadWorker(QThread):
     def _find_output_file(self) -> Optional[str]:
         if not self._expected_output_stem:
             return None
+        output_directory = os.path.dirname(self._expected_output_stem)
         try:
-            names = os.listdir(self.output_path)
+            names = os.listdir(output_directory)
         except OSError as exc:
             self.log_signal.emit(self.username, f"❌ Could not inspect segment output: {exc}")
             return None
@@ -1575,7 +1735,7 @@ class DownloadWorker(QThread):
         for name in names:
             if not name.startswith(prefix) or name.lower().endswith((".part", ".temp")):
                 continue
-            path = os.path.join(self.output_path, name)
+            path = os.path.join(output_directory, name)
             try:
                 if os.path.getsize(path) > 0:
                     found.append(path)
@@ -1748,10 +1908,11 @@ class DownloadWorker(QThread):
             self.remuxing_signal.emit(self.stream_url, False)
 
         output_prefix = f"{source_stem} segment "
+        output_directory = os.path.dirname(source_path)
         try:
             parts = sorted(
-                os.path.join(self.output_path, name)
-                for name in os.listdir(self.output_path)
+                os.path.join(output_directory, name)
+                for name in os.listdir(output_directory)
                 if name.startswith(os.path.basename(output_prefix))
                 and name.lower().endswith(f".{container}")
             )
@@ -1830,6 +1991,7 @@ class DownloadWorker(QThread):
         # final remux from the partial capture, and exiting the worker too early
         # would leave the .temp file behind.
         self._stripchat_stop = True
+        self._xlovecam_stop = True
 
         # Handle yt-dlp process if it exists
         proc = self.process
@@ -1843,96 +2005,136 @@ class DownloadWorker(QThread):
 #  Stream checker
 # ─────────────────────────────────────────────
 
-class StreamChecker(QThread):
-    status_signal = Signal(str, object, str)  # (url, StreamStatus, message)
+class SiteCheckWorker(QThread):
+    """Serially check the tracked streams for one site."""
+
+    status_signal = Signal(str, object, str)
 
     CHECK_INTERVAL = 90
     BACKOFF_STEP = 30
     MAX_CHECK_INTERVAL = 300
+    UNKNOWN_RETRY_INTERVAL = 5
 
-    def __init__(self, ytdlp_path: str = YTDLP_PATH):
-        super().__init__()
-        self.setObjectName("StreamChecker")
-        self._ytdlp   = ytdlp_path
+    def __init__(
+        self,
+        site_key: str,
+        ytdlp_path: str = YTDLP_PATH,
+        start_delay: float = 0,
+        parent: Optional[QObject] = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName(f"SiteCheckWorker-{site_key}")
+        self.site_key = site_key
+        self._ytdlp = ytdlp_path
+        self._start_delay = start_delay
         self._running = True
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._rate_limiter = RateLimiter(2.0)
-        self._lock: threading.Lock = threading.Lock()
+        self._lock = threading.Lock()
         self._tracked: dict[str, float] = {}
-        self._check_intervals: dict[str, float] = {}
-
-    # ── public API ──────────────────────────────
+        self._check_intervals: dict[str, int] = {}
 
     def add_stream(self, url: str, force: bool = False):
         with self._lock:
             if force or url not in self._tracked:
                 self._tracked[url] = 0.0
                 self._check_intervals[url] = self.CHECK_INTERVAL
+        self._wake_event.set()
 
     def remove_stream(self, url: str):
         with self._lock:
             self._tracked.pop(url, None)
             self._check_intervals.pop(url, None)
+        self._wake_event.set()
 
     def force_check(self, url: str):
-        """Reset timestamp so the URL is checked on the next loop tick."""
+        """Schedule a tracked URL for the next available site check."""
         with self._lock:
             if url in self._tracked:
                 self._tracked[url] = 0.0
                 self._check_intervals[url] = self.CHECK_INTERVAL
+        self._wake_event.set()
 
     def stop(self):
         self._running = False
-
-    # ── worker loop ─────────────────────────────
+        self._stop_event.set()
+        self._wake_event.set()
 
     def run(self):
-        while self._running:
-            now = time.time()
+        if self._stop_event.wait(self._start_delay):
+            return
 
+        while self._running:
+            self._wake_event.clear()
+            now = time.monotonic()
             with self._lock:
                 due = [
-                    url for url, last in self._tracked.items()
-                    if now - last >= self._check_intervals.get(url, self.CHECK_INTERVAL)
+                    url for url, last_check in self._tracked.items()
+                    if now - last_check >= self._check_intervals.get(
+                        url, self.CHECK_INTERVAL
+                    )
                 ]
 
-            for url in due:
-                if not self._running:
-                    break
-                status, message = self._check(url)
+            if due:
+                for url in due:
+                    if not self._running:
+                        break
+                    try:
+                        status, message = self._check(url)
+                    except Exception as exc:
+                        print(
+                            f"[Debug] {self.site_key} status check failed for "
+                            f"{url}: {exc!r}"
+                        )
+                        status, message = StreamStatus.ERROR, "❌ Site check failed"
 
-                # None means "no result this cycle" (transient unknown) --
-                # don't emit, don't update intervals, just try again next tick.
-                if status is None:
-                    continue
-
-                with self._lock:
-                    if url in self._tracked:
-                        self._tracked[url] = time.time()
+                    checked_at = time.monotonic()
+                    with self._lock:
+                        if url not in self._tracked:
+                            continue
+                        interval = self._check_intervals.get(
+                            url, self.CHECK_INTERVAL
+                        )
+                        if status is None:
+                            # Retry transient unknowns sooner than a full poll,
+                            # without letting them spin at the worker's idle tick.
+                            self._tracked[url] = checked_at - max(
+                                0, interval - self.UNKNOWN_RETRY_INTERVAL
+                            )
+                        else:
+                            self._tracked[url] = checked_at
                         if status == StreamStatus.ONLINE:
                             self._check_intervals[url] = self.CHECK_INTERVAL
                         elif status == StreamStatus.OFFLINE:
-                            current = self._check_intervals.get(url, self.CHECK_INTERVAL)
-                            self._check_intervals[url] = min(current + self.BACKOFF_STEP, self.MAX_CHECK_INTERVAL)
-                self.status_signal.emit(url, status, message)
+                            self._check_intervals[url] = min(
+                                interval + self.BACKOFF_STEP,
+                                self.MAX_CHECK_INTERVAL,
+                            )
+                    if status is not None:
+                        self.status_signal.emit(url, status, message or "")
+                continue
 
-            time.sleep(1)
+            with self._lock:
+                next_due = min(
+                    (
+                        self._check_intervals.get(url, self.CHECK_INTERVAL)
+                        - (now - last_check)
+                        for url, last_check in self._tracked.items()
+                    ),
+                    default=1.0,
+                )
+            self._wake_event.wait(max(0.1, min(next_due, 1.0)))
 
-    def _check(self, url: str) -> tuple[StreamStatus, str]:
+    def _check(self, url: str) -> tuple[Optional[StreamStatus], Optional[str]]:
         self._rate_limiter.wait_if_needed()
 
         if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(url):
             try:
                 result = STRIPCHAT_ADAPTER.check(url, user_agent=get_user_agent())
-
-                # "unknown" means the status couldn't be determined this poll
-                # (empty/missing/unrecognised status string). Return None so
-                # the caller skips this cycle entirely instead of emitting a
-                # status change -- this avoids flickering the GUI to Error
-                # and prevents force-stopping an active download for what is
-                # just a transient scrape race.
                 if result.value == "unknown":
                     print(f"[Debug] Skipping status update for {url}: {result.message}")
-                    return None, None
+                    return None, result.message
 
                 status_map = {
                     "online": StreamStatus.ONLINE,
@@ -1941,7 +2143,6 @@ class StreamChecker(QThread):
                     "away": StreamStatus.AWAY,
                 }
                 return status_map.get(result.value, StreamStatus.ERROR), result.message
-
             except Exception as exc:
                 message = str(exc).lower()
                 if "ticket" in message or "group" in message:
@@ -1969,6 +2170,9 @@ class StreamChecker(QThread):
             format_error=format_error_message,
         )
         result = check_status_for_url(url, context)
+        if result.value == "unknown":
+            print(f"[Debug] Skipping status update for {url}: {result.message}")
+            return None, result.message
         status_map = {
             "online": StreamStatus.ONLINE,
             "offline": StreamStatus.OFFLINE,
@@ -1976,6 +2180,121 @@ class StreamChecker(QThread):
             "away": StreamStatus.AWAY,
         }
         return status_map.get(result.value, StreamStatus.ERROR), result.message
+
+
+class StreamChecker(QObject):
+    """Coordinate independent, staggered check workers per site."""
+
+    status_signal = Signal(str, object, str)
+    START_STAGGER_SECONDS = 1.0
+    SITE_ORDER = (
+        "chaturbate.com",
+        "stripchat.com",
+        "bongacams.com",
+        "camsoda.com",
+        "xlovecam.com",
+    )
+
+    def __init__(self, ytdlp_path: str = YTDLP_PATH):
+        super().__init__()
+        self._ytdlp = ytdlp_path
+        self._lock = threading.Lock()
+        self._workers: dict[str, SiteCheckWorker] = {}
+        self._stream_sites: dict[str, str] = {}
+        self._running = False
+        for site_index, site_key in enumerate(self.SITE_ORDER):
+            self._create_worker(site_key, site_index)
+
+    def _create_worker(self, site_key: str, site_index: int) -> SiteCheckWorker:
+        worker = SiteCheckWorker(
+            site_key=site_key,
+            ytdlp_path=self._ytdlp,
+            start_delay=site_index * self.START_STAGGER_SECONDS,
+            parent=self,
+        )
+        worker.status_signal.connect(self.status_signal)
+        self._workers[site_key] = worker
+        if self._running:
+            worker.start()
+        return worker
+
+    @staticmethod
+    def _site_key_for_url(url: str) -> str:
+        hostname = hostname_from_url(url)
+        if hostname == "stripchat.com" or hostname.endswith(".stripchat.com"):
+            return "stripchat.com"
+        policy = get_site_policy(url)
+        return policy.key if policy else (hostname or "other")
+
+    def start(self):
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            workers = list(self._workers.values())
+        for worker in workers:
+            worker.start()
+
+    def add_stream(self, url: str, force: bool = False):
+        site_key = self._site_key_for_url(url)
+        with self._lock:
+            worker = self._workers.get(site_key)
+            if worker is None:
+                worker = self._create_worker(site_key, len(self._workers))
+            self._stream_sites[url] = site_key
+        worker.add_stream(url, force=force)
+
+    def remove_stream(self, url: str):
+        with self._lock:
+            site_key = self._stream_sites.pop(url, None)
+            worker = self._workers.get(site_key) if site_key else None
+        if worker:
+            worker.remove_stream(url)
+
+    def force_check(self, url: str):
+        with self._lock:
+            site_key = self._stream_sites.get(url)
+            worker = self._workers.get(site_key) if site_key else None
+        if worker:
+            worker.force_check(url)
+
+    def stop(self):
+        with self._lock:
+            self._running = False
+            workers = list(self._workers.values())
+        for worker in workers:
+            worker.stop()
+
+    def terminate(self):
+        """Last-resort shutdown for any site worker that did not stop in time."""
+        with self._lock:
+            workers = list(self._workers.values())
+        for worker in workers:
+            if worker.isRunning():
+                print(f"[Debug] Terminating unresponsive {worker.objectName()}")
+                worker.terminate()
+
+    def isRunning(self) -> bool:
+        with self._lock:
+            workers = list(self._workers.values())
+        return any(worker.isRunning() for worker in workers)
+
+    def wait(self, timeout: int = 0) -> bool:
+        """Wait for every site worker, respecting one total timeout budget."""
+        deadline = time.monotonic() + timeout / 1000 if timeout else None
+        with self._lock:
+            workers = list(self._workers.values())
+        for worker in workers:
+            if not worker.isRunning():
+                continue
+            remaining = (
+                max(0, int((deadline - time.monotonic()) * 1000))
+                if deadline is not None
+                else 0
+            )
+            if not worker.wait(remaining):
+                return False
+        return not any(worker.isRunning() for worker in workers)
 
 
 # ─────────────────────────────────────────────
@@ -2401,12 +2720,15 @@ class SettingsDialog(QDialog):
         recording_form.addRow("Video quality:", quality_row)
 
         self.filename_template_input = QLineEdit(FILENAME_TEMPLATE)
-        self.filename_template_input.setPlaceholderText("{username} {date} {time}")
+        self.filename_template_input.setPlaceholderText(
+            "{username}/{username} {date} {time}"
+        )
         recording_form.addRow("Filename template:", self.filename_template_input)
         filename_tokens = QLabel(
-            "Available: {site}, {username}, {date}, {time}, {resolution}, {fps}\n"
-            "Examples: {site}-{username}, {username}_{date}, "
-            "{username}_{date}_{fps}, {site}-{username}-{time}_{resolution}"
+            "Available: {site}, {username}, {date}, {time}, {resolution}, {fps}. "
+            "Use / to create subfolders.\n"
+            "Examples: {username} {date} {time}, {username}/{username} {date} {time}, "
+            "{site}/{username}/{username} {date} {time}"
         )
         filename_tokens.setWordWrap(True)
         filename_tokens.setStyleSheet("color: #888; font-size: 11px;")
@@ -3101,8 +3423,6 @@ class StreamDownloaderGUI(QMainWindow):
         self.checker = StreamChecker()
         self.checker.setParent(self)
         self.checker.status_signal.connect(self._on_status)
-        self.checker.finished.connect(lambda: print("[Debug] StreamChecker finished"))
-        self.checker.finished.connect(self.checker.deleteLater)
         self.checker.destroyed.connect(lambda: print("[Debug] StreamChecker destroyed"))
         self.checker.start()
 
@@ -3126,6 +3446,7 @@ class StreamDownloaderGUI(QMainWindow):
         self._settings_dialog.settings_changed.connect(self._save)
         self._settings_dialog.settings_changed.connect(self._update_browser_unset_banner)
         self._settings_dialog.settings_changed.connect(self._update_download_info)
+        self._settings_dialog.settings_changed.connect(self._update_disk_space_info)
         self._settings_dialog.cookie_access_confirmed_broken.connect(self._maybe_show_chromium_cookie_dialog)
 
         # Convenience references so the rest of the class can keep reading
@@ -3136,6 +3457,9 @@ class StreamDownloaderGUI(QMainWindow):
 
         self._build_ui()
         self.setStyleSheet(DARK)
+        self._disk_space_timer = QTimer(self)
+        self._disk_space_timer.timeout.connect(self._update_disk_space_info)
+        self._disk_space_timer.start(30000)
         self._load_saved_streams()
         self._update_download_info()
         self._update_browser_unset_banner()
@@ -3154,7 +3478,7 @@ class StreamDownloaderGUI(QMainWindow):
 
     def _load_saved_streams(self):
         global SECONDARY_DOWNLOAD_ENABLED, SECONDARY_DOWNLOAD_OUTPUT
-        global MINIMUM_FREE_SPACE_GB
+        global MINIMUM_FREE_SPACE_GB, FILENAME_TEMPLATE
         saved = load_saved_streams()
         if not saved:
             return
@@ -3202,10 +3526,14 @@ class StreamDownloaderGUI(QMainWindow):
             self._settings_dialog._update_secondary_download_controls()
 
         saved_filename_template = settings.get("filename_template")
+        migrated_filename_template = (
+            saved_filename_template == _LEGACY_DEFAULT_FILENAME_TEMPLATE
+        )
+        if migrated_filename_template:
+            saved_filename_template = FILENAME_TEMPLATE
         if isinstance(saved_filename_template, str):
             _, template_error = _filename_template_preview(saved_filename_template)
             if not template_error:
-                global FILENAME_TEMPLATE
                 FILENAME_TEMPLATE = saved_filename_template
                 self._settings_dialog.filename_template_input.setText(FILENAME_TEMPLATE)
 
@@ -3366,6 +3694,9 @@ class StreamDownloaderGUI(QMainWindow):
             url = entry["url"]
             auto = entry["auto_start"]
             self._add_stream(url=url, auto_start=auto, silent=True)
+
+        if migrated_filename_template:
+            self._save()
 
         if saved:
             restored_count = len(saved.get("streams", []))
@@ -3529,12 +3860,22 @@ class StreamDownloaderGUI(QMainWindow):
         splitter.setStretchFactor(1, 1)
         vbox.addWidget(splitter)
 
+        download_info_row = QHBoxLayout()
         self._download_info_label = QLabel("Download info: idle")
         self._download_info_label.setObjectName("sectionLabel")
         self._download_info_label.setStyleSheet(
             "font-size:11px; color:#8fb3ff; padding:4px 0 0 0;"
         )
-        vbox.addWidget(self._download_info_label)
+        download_info_row.addWidget(self._download_info_label)
+        download_info_row.addStretch(1)
+        self._disk_space_label = QLabel("—")
+        self._disk_space_label.setObjectName("sectionLabel")
+        self._disk_space_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._disk_space_label.setStyleSheet(
+            "font-size:11px; color:#8fb3ff; padding:4px 0 0 0;"
+        )
+        download_info_row.addWidget(self._disk_space_label)
+        vbox.addLayout(download_info_row)
 
         # Status bar
         self._status_bar = QStatusBar()
@@ -3558,10 +3899,10 @@ class StreamDownloaderGUI(QMainWindow):
             return
         if url in self.stream_items:
             if not silent:
-                QMessageBox.warning(self, "Warning", f"'{extract_username(url)}' is already in the list")
+                QMessageBox.warning(self, "Warning", f"'{extract_stream_username(url)}' is already in the list")
             return
 
-        username = extract_username(url)
+        username = extract_stream_username(url)
         row = self._table.rowCount()
         self._table.insertRow(row)
         self._table.setRowHeight(row, 64)
@@ -4260,6 +4601,59 @@ class StreamDownloaderGUI(QMainWindow):
         summary, _, _ = self._estimate_download_info()
         if self._download_info_label:
             self._download_info_label.setText(f"Download info: {summary}")
+        self._update_disk_space_info()
+
+    @staticmethod
+    def _folder_disk_usage(folder: str):
+        """Read disk usage for a folder, including not-yet-created output folders."""
+        path = os.path.abspath(os.path.expanduser(folder.strip() or "Downloads"))
+        probe_path = path
+        while not os.path.exists(probe_path):
+            parent = os.path.dirname(probe_path)
+            if parent == probe_path:
+                raise OSError(f"No existing parent directory for {path}")
+            probe_path = parent
+        if not os.path.isdir(probe_path):
+            raise NotADirectoryError(probe_path)
+        return path, shutil.disk_usage(probe_path)
+
+    def _update_disk_space_info(self):
+        label = getattr(self, "_disk_space_label", None)
+        if label is None:
+            return
+
+        primary_folder = self._out_input.text().strip() or "Downloads"
+        try:
+            selected_path, usage = self._folder_disk_usage(primary_folder)
+        except OSError as exc:
+            label.setText("Disk space unavailable")
+            label.setToolTip(f"Cannot read disk space for {primary_folder}: {exc}")
+            return
+
+        threshold_bytes = max(1, MINIMUM_FREE_SPACE_GB) * 1024 ** 3
+        secondary_error = None
+        if (
+            usage.free < threshold_bytes
+            and SECONDARY_DOWNLOAD_ENABLED
+            and SECONDARY_DOWNLOAD_OUTPUT.strip()
+        ):
+            try:
+                secondary_path, secondary_usage = self._folder_disk_usage(
+                    SECONDARY_DOWNLOAD_OUTPUT
+                )
+            except OSError as exc:
+                secondary_error = str(exc)
+            else:
+                if secondary_usage.free >= threshold_bytes:
+                    selected_path, usage = secondary_path, secondary_usage
+
+        free_gb = usage.free / 1024 ** 3
+        total_gb = usage.total / 1024 ** 3
+        label.setText(f"{free_gb:.0f} GB / {total_gb:.0f} GB")
+        tooltip = f"Free / total space on {selected_path}"
+        if secondary_error:
+            tooltip += f"\nSecondary location unavailable: {secondary_error}"
+        label.setToolTip(tooltip)
 
     def _update_dl_ui(self, url: str, active: bool):
         item = self.stream_items.get(url)
@@ -4330,7 +4724,7 @@ class StreamDownloaderGUI(QMainWindow):
         sb.setValue(sb.maximum())
         self._status_bar.showMessage(message, 3000)
 
-    def _wait_for_stop(self, worker: QThread) -> bool:
+    def _wait_for_stop(self, worker: QThread | StreamChecker) -> bool:
         """Waits for a QThread that's already been signaled to stop,
         escalating to terminate() if it doesn't stop gracefully within
         5s, then giving it 2s more. Returns False if it's still alive
