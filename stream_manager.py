@@ -111,8 +111,8 @@ DOWNLOAD_OUTPUT = "Downloads" # Folder downloads are saved to. Settable from the
 SECONDARY_DOWNLOAD_ENABLED = False
 SECONDARY_DOWNLOAD_OUTPUT = ""
 MINIMUM_FREE_SPACE_GB = 5
-FILENAME_TEMPLATE = "{username}/{username} {date} {time}"
-_LEGACY_DEFAULT_FILENAME_TEMPLATE = "{username} {date} {time}"
+FILENAME_TEMPLATE = "{username} {date} {time}"
+_LEGACY_NESTED_DEFAULT_FILENAME_TEMPLATE = "{username}/{username} {date} {time}"
 MAX_DOWNLOAD_RESOLUTION = "1920x1080" # 3840x2160, 1920x1080, 1280x720, 960x540, 640x360
 MAX_DOWNLOAD_FPS = 30 # 60 or 30
 SPLIT_BY_FILESIZE_ENABLED = False
@@ -1070,12 +1070,17 @@ class DownloadWorker(QThread):
         self.setObjectName(f"DownloadWorker-{username}")
         self.stream_url  = stream_url
         self.username    = username
-        self.output_path = os.path.join(output_path, username)
         self.filename_template = FILENAME_TEMPLATE
+        self.output_path = (
+            output_path
+            if "/" in self.filename_template
+            else os.path.join(output_path, username)
+        )
         self.process: Optional[subprocess.Popen] = None
         self.is_running  = False
         self.manual_stop = False
         self._run_finished = False
+        self.is_remuxing = False
         self._rate_limiter = RateLimiter(2.0)
         self._line_queue: Queue = Queue()
         self._started_at = 0.0
@@ -1096,6 +1101,14 @@ class DownloadWorker(QThread):
         self._expected_output_stem = ""
         os.makedirs(self.output_path, exist_ok=True)
 
+    def _build_output_path(self, filename: str) -> str:
+        """Resolve explicit template folders from the output root."""
+        output_file = os.path.join(
+            self.output_path, filename.replace("/", os.sep)
+        )
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        return output_file
+
     def _run_stripchat_download(self) -> bool:
         """Run the native Stripchat session through its site adapter."""
         if not STRIPCHAT_ADAPTER or not STRIPCHAT_ADAPTER.matches(self.stream_url):
@@ -1108,8 +1121,10 @@ class DownloadWorker(QThread):
         # and flip the "remuxing" flag on the GUI row.
         def wrapped_log(message: str):
             if "Remuxing with FFmpeg" in message:
+                self.is_remuxing = True
                 self.remuxing_signal.emit(self.stream_url, True)
             elif "Remuxed to:" in message:
+                self.is_remuxing = False
                 self.remuxing_signal.emit(self.stream_url, False)
             self.log_signal.emit(self.username, message)
 
@@ -1147,8 +1162,7 @@ class DownloadWorker(QThread):
             return None
 
         def make_stripchat_output_file(resolution: str, fps: int) -> str:
-            path = os.path.join(
-                self.output_path,
+            return self._build_output_path(
                 _build_download_filename_stem(
                     self.filename_template,
                     self.stream_url,
@@ -1157,10 +1171,8 @@ class DownloadWorker(QThread):
                     resolution,
                     fps,
                     self.segment_number if self._during_split else None,
-                ) + ".mp4",
+                ) + ".mp4"
             )
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            return path
 
         result = STRIPCHAT_ADAPTER.download(
             stream_url=self.stream_url,
@@ -1184,6 +1196,7 @@ class DownloadWorker(QThread):
         )
 
         # Always clear the remuxing flag when we exit, even on error
+        self.is_remuxing = False
         self.remuxing_signal.emit(self.stream_url, False)
 
         self._stripchat_stop = False
@@ -1235,13 +1248,14 @@ class DownloadWorker(QThread):
 
         def wrapped_log(message: str) -> None:
             if "Remuxing with FFmpeg" in message:
+                self.is_remuxing = True
                 self.remuxing_signal.emit(self.stream_url, True)
             elif "Remuxed to:" in message:
+                self.is_remuxing = False
                 self.remuxing_signal.emit(self.stream_url, False)
             self.log_signal.emit(self.username, message)
 
-        output_file = os.path.join(
-            self.output_path,
+        output_file = self._build_output_path(
             _build_download_filename_stem(
                 self.filename_template,
                 self.stream_url,
@@ -1250,9 +1264,8 @@ class DownloadWorker(QThread):
                 "unknown",
                 0,
                 self.segment_number if self._during_split else None,
-            ) + ".mp4",
+            ) + ".mp4"
         )
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
         self.resolution_signal.emit(self.stream_url, "", 0)
         if self.manual_stop:
             self.is_running = False
@@ -1269,6 +1282,7 @@ class DownloadWorker(QThread):
             subprocess_kwargs=_subprocess_kwargs(),
             on_resolution=report_resolution,
         )
+        self.is_remuxing = False
         self.remuxing_signal.emit(self.stream_url, False)
         output_exists = bool(
             result.output_file
@@ -1463,7 +1477,7 @@ class DownloadWorker(QThread):
                 fps or MAX_DOWNLOAD_FPS,
                 self.segment_number if self._during_split else None,
             )
-            self._expected_output_stem = os.path.join(self.output_path, filename_stem)
+            self._expected_output_stem = self._build_output_path(filename_stem)
             os.makedirs(os.path.dirname(self._expected_output_stem), exist_ok=True)
             if self.manual_stop:
                 return
@@ -1479,10 +1493,7 @@ class DownloadWorker(QThread):
                     f"*0-{self.target_duration_seconds}",
                 ])
             cmd.extend([
-                "-o", os.path.join(
-                    self.output_path,
-                    f"{filename_stem}.%(ext)s"
-                ),
+                "-o", self._build_output_path(f"{filename_stem}.%(ext)s"),
                 "--no-overwrites", "--continue", "--no-part",
                 "--skip-unavailable-fragments", "--hls-use-mpegts",
                 "--no-live-from-start",
@@ -1831,6 +1842,7 @@ class DownloadWorker(QThread):
             "size-limited clips with FFmpeg…",
         )
         self.remuxing_signal.emit(self.stream_url, True)
+        self.is_remuxing = True
         source_duration = duration
         offset = 0.0
         segment_number = 1
@@ -1905,6 +1917,7 @@ class DownloadWorker(QThread):
         except OSError as exc:
             split_error = f"Could not run FFmpeg: {exc}"
         finally:
+            self.is_remuxing = False
             self.remuxing_signal.emit(self.stream_url, False)
 
         output_prefix = f"{source_stem} segment "
@@ -2721,7 +2734,7 @@ class SettingsDialog(QDialog):
 
         self.filename_template_input = QLineEdit(FILENAME_TEMPLATE)
         self.filename_template_input.setPlaceholderText(
-            "{username}/{username} {date} {time}"
+            "{username} {date} {time}"
         )
         recording_form.addRow("Filename template:", self.filename_template_input)
         filename_tokens = QLabel(
@@ -3527,7 +3540,7 @@ class StreamDownloaderGUI(QMainWindow):
 
         saved_filename_template = settings.get("filename_template")
         migrated_filename_template = (
-            saved_filename_template == _LEGACY_DEFAULT_FILENAME_TEMPLATE
+            saved_filename_template == _LEGACY_NESTED_DEFAULT_FILENAME_TEMPLATE
         )
         if migrated_filename_template:
             saved_filename_template = FILENAME_TEMPLATE
@@ -4513,11 +4526,21 @@ class StreamDownloaderGUI(QMainWindow):
         worker = self.download_workers.get(url)
         if worker:
             worker.stop()
-            # Give Stripchat downloads longer to finish their remux
-            timeout = 30000 if (STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(url)) else 5000
-            if not worker.wait(timeout):
-                worker.terminate()
-                worker.wait(2000)
+            if worker.is_remuxing:
+                worker.wait()
+            else:
+                # Give Stripchat downloads longer to finish their remux.
+                timeout = (
+                    30000
+                    if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(url)
+                    else 5000
+                )
+                if not worker.wait(timeout):
+                    if worker.is_remuxing:
+                        worker.wait()
+                    else:
+                        worker.terminate()
+                        worker.wait(2000)
             worker.deleteLater()
             self.download_workers.pop(url, None)
 
@@ -4730,10 +4753,20 @@ class StreamDownloaderGUI(QMainWindow):
         5s, then giving it 2s more. Returns False if it's still alive
         even after that — caller decides what to do (e.g. a DownloadWorker
         that won't die gets kept around instead of dropped, to avoid a
-        QThread destructor warning on a thread that's still running)."""
+        QThread destructor warning on a thread that's still running).
+        Download workers are allowed to finish remuxing without a timeout."""
         if not worker.isRunning():
             return True
-        if not worker.wait(5000):
+        waited_ms = 0
+        while waited_ms < 5000:
+            if isinstance(worker, DownloadWorker) and worker.is_remuxing:
+                return worker.wait()
+            if worker.wait(100):
+                return True
+            waited_ms += 100
+        if isinstance(worker, DownloadWorker) and worker.is_remuxing:
+            return worker.wait()
+        if worker.isRunning():
             worker.terminate()
             if not worker.wait(2000):
                 return False

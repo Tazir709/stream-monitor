@@ -485,7 +485,6 @@ class XloveCamSiteAdapter:
                 remux_command,
                 capture_output=True,
                 text=True,
-                timeout=120,
                 **(subprocess_kwargs or {}),
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -498,17 +497,65 @@ class XloveCamSiteAdapter:
             )
         if remux_result.returncode != 0:
             remux_error = (remux_result.stderr or remux_result.stdout or "").strip()
-            return XloveCamDownloadResult(
-                "error",
-                (
-                    f"FFmpeg remux exited with code {remux_result.returncode}"
-                    + (f": {remux_error}" if remux_error else "")
-                    + f". Raw capture preserved at {capture_file}"
-                ),
-                output_file=capture_file,
-                resolution=detected_format[0] if detected_format else "",
-                fps=detected_format[1] if detected_format else 0,
-            )
+            if on_log:
+                on_log(
+                    "AAC packet-copy remux failed; retrying with audio re-encoding."
+                )
+            fallback_command = [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel", "error",
+                "-y",
+                "-fflags", "+genpts",
+                "-i", capture_file,
+                "-map", "0:v?",
+                "-map", "0:a?",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "96k",
+                "-movflags", "+faststart",
+                output_file,
+            ]
+            try:
+                fallback_result = subprocess.run(
+                    fallback_command,
+                    capture_output=True,
+                    text=True,
+                    **(subprocess_kwargs or {}),
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                return XloveCamDownloadResult(
+                    "error",
+                    (
+                        f"FFmpeg packet-copy remux failed"
+                        + (f": {remux_error}" if remux_error else "")
+                        + f"; AAC re-encode retry failed: {exc}. "
+                        f"Raw capture preserved at {capture_file}"
+                    ),
+                    output_file=capture_file,
+                    resolution=detected_format[0] if detected_format else "",
+                    fps=detected_format[1] if detected_format else 0,
+                )
+            if fallback_result.returncode != 0:
+                fallback_error = (
+                    fallback_result.stderr or fallback_result.stdout or ""
+                ).strip()
+                return XloveCamDownloadResult(
+                    "error",
+                    (
+                        f"FFmpeg packet-copy remux failed"
+                        + (f": {remux_error}" if remux_error else "")
+                        + f"; AAC re-encode retry exited with code "
+                        f"{fallback_result.returncode}"
+                        + (f": {fallback_error}" if fallback_error else "")
+                        + f". Raw capture preserved at {capture_file}"
+                    ),
+                    output_file=capture_file,
+                    resolution=detected_format[0] if detected_format else "",
+                    fps=detected_format[1] if detected_format else 0,
+                )
+            if on_log:
+                on_log("Remux succeeded with AAC audio re-encoded.")
         try:
             if os.path.getsize(output_file) <= 0:
                 return XloveCamDownloadResult(

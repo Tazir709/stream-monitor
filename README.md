@@ -80,7 +80,7 @@ On Windows, you can also use the launchers in the project folder:
 - **Browser & Cookies:** browser/profile, optional exported cookies file, and User-Agent.
 - **Recording:** maximum resolution and FPS, filename template, and optional file-size splitting.
 
-Settings are saved automatically. The default filename template is `{username}/{username} {date} {time}`. Templates support `{site}`, `{username}`, `{date}`, `{time}`, `{resolution}`, and `{fps}`. Use forward slashes (`/`) to create subfolders, for example `{site}/{username}/{username} {date} {time}`.
+Settings are saved automatically. The default filename template is `{username} {date} {time}`; recordings are already organized into a folder for each model. Templates support `{site}`, `{username}`, `{date}`, `{time}`, `{resolution}`, and `{fps}`. Use forward slashes (`/`) to define folders from the selected output directory, for example `{site}/{username}/{username} {date} {time}`.
 
 File-size splitting can happen during recording (with brief gaps between segments) or after recording (which temporarily needs additional disk space). Actual segment sizes may vary with stream bitrate and keyframes.
 
