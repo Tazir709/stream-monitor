@@ -8,11 +8,18 @@ A desktop GUI for monitoring and automatically recording live streams from multi
 - [stripchat.com](https://stripchat.com)
 - [bongacams.com](https://bongacams.com)
 - [camsoda.com](https://camsoda.com)
+- [myfreecams.com](https://www.myfreecams.com)
 - [xlovecam.com](https://www.xlovecam.com)
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/Tazir709/stream-monitor)](https://github.com/Tazir709/stream-monitor/releases/latest)
+
+## Feedback & Support
+
+Found a bug, experiencing an issue, or have an idea for a new feature? **[Open an issue](https://github.com/Tazir709/stream-monitor/issues)** on GitHub.
+
+Bug reports and feature suggestions are welcome!
 
 ## Features
 
@@ -68,11 +75,24 @@ Launch `stream_manager.py` (double-click on Windows, or run `python stream_manag
 On Windows, you can also use the launchers in the project folder:
 
 - Double-click `launch.bat` for normal use without a console window.
-- Double-click `launch_debug.bat` to keep a console open and see error output.
+- Double-click `launch_debug.bat` to keep a console open and see timestamped diagnostics for startup, status checks, previews, downloads, queue decisions, and settings errors. URL query strings are redacted in debug output.
 
 1. Open **Settings** to choose your download folder and configure browser cookies if needed.
 2. Paste a supported model URL, such as `https://chaturbate.com/username/`, and select **Add Stream**.
 3. Use **Start**/**Stop** to control recording, or enable **Auto** to record when the model goes live.
+
+## Supported URL Formats
+
+Paste a model's profile URL into the **Add Stream** field. The `https://` prefix and trailing slashes are optional.
+
+| Site | Accepted URL format |
+|---|---|
+| Chaturbate | `chaturbate.com/username` |
+| Stripchat | `stripchat.com/username` |
+| CamSoda | `camsoda.com/username` |
+| BongaCams | `bongacams.com/username` |
+| XLoveCam | `xlovecam.com/en/model/username` |
+| MyFreeCams | `myfreecams.com/#username` |
 
 ## Settings at a glance
 

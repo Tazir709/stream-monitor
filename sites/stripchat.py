@@ -51,7 +51,7 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 from datetime import datetime
 from PySide6.QtCore import QThread, Signal, Qt
-from .base import SiteStatus
+from .base import SiteStatus, debug_exception, debug_log
 from .registry import hostname_from_url
 
 IS_WINDOWS = sys.platform == "win32"
@@ -839,7 +839,10 @@ def extract_frame_from_segment(segment_data: bytes, init_data: bytes, width: int
     Uses memory piping instead of temp files for better cross-platform compatibility.
     """
     if not FFMPEG_HAS_NATIVE_H264_DECODER:
-        print("[Debug] ffmpeg build does not expose a native H.264 decoder; skipping Stripchat preview frame.")
+        debug_log(
+            "Stripchat",
+            "FFmpeg has no native H.264 decoder; skipping preview frame extraction",
+        )
         return None
 
     try:
@@ -873,19 +876,22 @@ def extract_frame_from_segment(segment_data: bytes, init_data: bytes, width: int
         except subprocess.TimeoutExpired:
             process.kill()
             stdout, stderr = process.communicate()
-            print("[Debug] ffmpeg timed out")
+            debug_log("Stripchat", "FFmpeg preview frame extraction timed out")
             return None
 
         if process.returncode == 0 and len(stdout) >= width * height * 3:
             return stdout[:width * height * 3]
 
         if stderr:
-            print(f"[Debug] ffmpeg stderr: {stderr.decode('utf-8', errors='replace')[:200]}")
+            debug_log(
+                "Stripchat",
+                f"FFmpeg preview stderr: {stderr.decode('utf-8', errors='replace')[:1000]}",
+            )
 
         return None
 
     except Exception as e:
-        print(f"[Debug] Failed to extract frame: {e!r}")
+        debug_exception("Stripchat", "failed to extract preview frame", e)
         return None
 
 
@@ -898,7 +904,7 @@ def get_preview_frame(stream_url: str, target_height: int = 720, user_agent: Opt
         info = get_stream_info(stream_url, target_height, user_agent=user_agent)
 
         if not info.is_accessible:
-            print(f"[Debug] Stream not accessible: {info.status}")
+            debug_log("Stripchat", f"preview stream unavailable: {info.status}")
             return None
 
         if not info.is_live:
@@ -979,7 +985,7 @@ def get_preview_frame(stream_url: str, target_height: int = 720, user_agent: Opt
         return None
 
     except Exception as e:
-        print(f"[Debug] Failed to get preview frame: {e!r}")
+        debug_exception("Stripchat", "failed to retrieve preview frame", e)
         return None
 
 
@@ -1005,7 +1011,7 @@ class StripchatSiteAdapter:
         # poll cycle instead of misclassifying the stream or killing an
         # active download.
         if not status:
-            print(f"[Debug] Empty Stripchat status for {username}")
+            debug_log("Stripchat", f"empty status returned for {username}")
             return SiteStatus("unknown", "❓ Unknown")
 
         messages = {
@@ -1025,7 +1031,7 @@ class StripchatSiteAdapter:
         # Unknown status string (new value we haven't seen yet). Log it and
         # treat as "unknown" rather than crashing -- the next poll will
         # hopefully return something we recognise.
-        print(f"[Debug] Unknown Stripchat status: {status!r}")
+        debug_log("Stripchat", f"unknown status value for {username}: {status!r}")
         return SiteStatus("unknown", f"❓ Unknown ({status})")
 
     @staticmethod

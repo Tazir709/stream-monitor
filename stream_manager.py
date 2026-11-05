@@ -45,6 +45,7 @@ import tempfile
 import time
 import threading
 import math
+import traceback
 import psutil
 import re
 import json
@@ -55,7 +56,6 @@ from typing import Optional, Dict, Callable
 from datetime import datetime
 from queue import Queue, Empty
 from dataclasses import dataclass
-import traceback
 import requests
 
 from PySide6.QtWidgets import (
@@ -85,6 +85,9 @@ from sites.xlovecam import (
     XloveCamSiteAdapter,
     username_from_url as xlovecam_username_from_url,
 )
+from sites.myfreecams import username_from_url as myfreecams_username_from_url
+from sites.myfreecams import MyFreeCamsSiteAdapter
+from sites.base import configure_debug_logging
 
 try:
     from sites.stripchat import (
@@ -97,6 +100,45 @@ except ImportError:  # pragma: no cover - used when the helper module is unavail
 
 STRIPCHAT_ADAPTER = StripchatSiteAdapter() if StripchatSiteAdapter else None
 XLOVECAM_ADAPTER = XloveCamSiteAdapter()
+MYFREECAMS_ADAPTER = MyFreeCamsSiteAdapter()
+
+
+def debug_enabled() -> bool:
+    return os.environ.get("STREAM_MONITOR_DEBUG", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def debug_log(component: str, message: str) -> None:
+    if not debug_enabled():
+        return
+    message = re.sub(
+        r"(https?://[^\s'\"<>?]+)\?[^\s'\"<>]*",
+        r"\1?<query-redacted>",
+        message,
+        flags=re.IGNORECASE,
+    )
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    thread_name = threading.current_thread().name
+    print(
+        f"[{timestamp}] [Debug] [{thread_name}] [{component}] {message}",
+        flush=True,
+    )
+
+
+def debug_exception(
+    component: str,
+    message: str,
+    exc: Optional[BaseException] = None,
+) -> None:
+    if not debug_enabled():
+        return
+    debug_log(component, f"{message}: {exc!r}" if exc is not None else message)
+    if exc is not None:
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+
+configure_debug_logging(debug_log, debug_exception)
 
 
 # ─────────────────────────────────────────────
@@ -312,6 +354,7 @@ def measure_download_speed(test_size_mb: int = 30) -> float:
     total_requested_bytes = test_size_mb * 1024 * 1024
     test_url = f"https://speed.cloudflare.com/__down?bytes={total_requested_bytes}"
 
+    debug_log("bandwidth", f"starting speed test ({test_size_mb} MB)")
     try:
         start_time = time.time()
         response = requests.get(test_url, stream=True, timeout=30)
@@ -329,11 +372,18 @@ def measure_download_speed(test_size_mb: int = 30) -> float:
             return 0.0
 
         speed_mb_s = (total_bytes / elapsed) / (1024 * 1024)
+        debug_log(
+            "bandwidth",
+            f"speed test received {total_bytes:,} bytes in {elapsed:.2f}s "
+            f"({speed_mb_s:.2f} MB/s)",
+        )
         return round(speed_mb_s, 2)
 
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as exc:
+        debug_exception("bandwidth", "speed test request failed", exc)
         return 0.0
-    except Exception:
+    except Exception as exc:
+        debug_exception("bandwidth", "unexpected speed test failure", exc)
         return 0.0
 
 
@@ -676,12 +726,19 @@ def extract_stream_username(url: str) -> str:
     """Extract the site-specific model name used for labels and output paths."""
     if XLOVECAM_ADAPTER.matches(url):
         return xlovecam_username_from_url(url)
+    policy = get_site_policy(url)
+    if policy and policy.key == "myfreecams.com":
+        return myfreecams_username_from_url(url)
     return extract_username(url)
 
 
 def log_exception(prefix: str) -> None:
-    print(f"[Debug] {prefix}")
-    traceback.print_exc()
+    exc_type, exc_value, _ = sys.exc_info()
+    debug_exception(
+        "exception",
+        prefix,
+        exc_value if exc_type is not None else None,
+    )
 
 
 CHROMIUM_COOKIE_ERROR_MSG = "🔒 Chrome cookie access failed — see Troubleshooting in the README"
@@ -811,10 +868,10 @@ class SharedPreviewWorker(QThread):
                 try:
                     p.kill(); p.wait(timeout=2)
                 except Exception as e:
-                    print(f"[Debug] SharedPreviewWorker.stop: ffmpeg process already gone or failed to kill: {e!r}")
+                    debug_exception("preview", "could not stop FFmpeg preview process", e)
             self._ffmpeg_processes.clear()
         if not self.wait(6000):
-            print("[Debug] SharedPreviewWorker did not stop in time, terminating")
+            debug_log("preview", "worker did not stop in time; terminating")
             self.terminate()
             self.wait(2000)
 
@@ -834,13 +891,13 @@ class SharedPreviewWorker(QThread):
                     self._stream_url_cache[page_url] = ("stripchat_preview", time.time() + self.HLS_CACHE_LIFETIME)
                     self._stripchat_preview_cache[page_url] = frame_data
                     return "stripchat_preview"
-                print(f"[Debug] Stripchat preview data unavailable for {page_url}; no preview available")
+                debug_log("preview", f"Stripchat preview data unavailable for {page_url}")
             except Exception as e:
-                print(f"[Debug] Stripchat preview failed: {e!r}")
+                debug_exception("preview", f"Stripchat preview failed for {page_url}", e)
                 return None
 
         if requires_authentication(page_url, BROWSER):
-            print(f"[Debug] PreviewWorker _get_stream_url skipped for {page_url}: {BROWSER_REQUIRED_MSG}")
+            debug_log("preview", f"preview blocked for {page_url}: browser authentication required")
             return None
 
         try:
@@ -864,7 +921,7 @@ class SharedPreviewWorker(QThread):
                 return url
             if r.returncode != 0:
                 err = format_error_message(r.stderr, r.stdout)
-                print(f"[Debug] PreviewWorker _get_stream_url failed for {page_url}: {err}")
+                debug_log("preview", f"stream URL lookup failed for {page_url}: {err}")
         except Exception:
             log_exception(f"PreviewWorker _get_stream_url failed for {page_url}")
         return None
@@ -873,11 +930,11 @@ class SharedPreviewWorker(QThread):
         if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(page_url):
             frame_data = STRIPCHAT_ADAPTER.preview_data(page_url, user_agent=get_user_agent())
             if frame_data is None:
-                print(f"[Debug] Stripchat preview frame was empty for {page_url}")
+                debug_log("preview", f"Stripchat preview frame was empty for {page_url}")
                 return
             image_bytes, width, height = frame_data
             if not image_bytes:
-                print(f"[Debug] Stripchat preview frame was empty for {page_url}")
+                debug_log("preview", f"Stripchat preview frame was empty for {page_url}")
                 return
             try:
                 img = QImage(image_bytes, width, height, width * 3, QImage.Format_RGB888)
@@ -886,9 +943,9 @@ class SharedPreviewWorker(QThread):
                     self._pixmap_cache[page_url] = px
                     self.preview_updated.emit(page_url, px)
                     return
-                print(f"[Debug] Stripchat preview produced null pixmap for {page_url}")
+                debug_log("preview", f"Stripchat preview produced null pixmap for {page_url}")
             except Exception as e:
-                print(f"[Debug] Stripchat preview QImage conversion failed for {page_url}: {e!r}")
+                debug_exception("preview", f"Stripchat image conversion failed for {page_url}", e)
             return
 
         if XLOVECAM_ADAPTER.matches(page_url):
@@ -909,9 +966,33 @@ class SharedPreviewWorker(QThread):
                         self._pixmap_cache[page_url] = pixmap
                         self.preview_updated.emit(page_url, pixmap)
                         return
-                print(f"[Debug] XloveCam preview unavailable for {page_url}")
+                debug_log("preview", f"XloveCam preview unavailable for {page_url}")
             except Exception as exc:
-                print(f"[Debug] XloveCam preview failed for {page_url}: {exc!r}")
+                debug_exception("preview", f"XloveCam preview failed for {page_url}", exc)
+            return
+
+        if MYFREECAMS_ADAPTER.matches(page_url):
+            try:
+                frame_data = MYFREECAMS_ADAPTER.preview_data(
+                    page_url,
+                    user_agent=get_user_agent(),
+                    ffmpeg_path=FFMPEG_PATH,
+                    subprocess_kwargs=_subprocess_kwargs(),
+                    max_resolution=MAX_DOWNLOAD_RESOLUTION,
+                )
+                if frame_data:
+                    image_bytes, width, height = frame_data
+                    img = QImage(
+                        image_bytes, width, height, width * 3, QImage.Format_RGB888
+                    )
+                    pixmap = QPixmap.fromImage(img)
+                    if not pixmap.isNull():
+                        self._pixmap_cache[page_url] = pixmap
+                        self.preview_updated.emit(page_url, pixmap)
+                        return
+                debug_log("preview", f"MyFreeCams preview unavailable for {page_url}")
+            except Exception as exc:
+                debug_exception("preview", f"MyFreeCams preview failed for {page_url}", exc)
             return
 
         stream_url = self._get_stream_url(page_url)
@@ -948,14 +1029,20 @@ class SharedPreviewWorker(QThread):
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
         try:
-            print(f"[Debug] ffmpeg preview command for {page_url}: {' '.join(cmd)}")
+            debug_log("preview", f"starting FFmpeg frame capture for {page_url}")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, **kwargs)
             with self._lock:
                 self._ffmpeg_processes.append(proc)
             try:
                 stdout, stderr = proc.communicate(timeout=30)
-                print(f"[Debug] ffmpeg preview stderr for {page_url}: {stderr.decode('utf-8', 'replace')[:1000]}")
+                stderr_text = stderr.decode("utf-8", "replace")
+                if proc.returncode != 0 or stderr_text.strip():
+                    debug_log(
+                        "preview",
+                        f"FFmpeg frame capture exited {proc.returncode} for {page_url}; "
+                        f"stderr={stderr_text[:1000]!r}",
+                    )
                 expected = W * H * 3
                 if len(stdout) >= expected:
                     img = QImage(stdout[:expected], W, H, W * 3, QImage.Format_RGB888)
@@ -963,12 +1050,17 @@ class SharedPreviewWorker(QThread):
                     if not px.isNull():
                         self._pixmap_cache[page_url] = px
                         self.preview_updated.emit(page_url, px)
+                        debug_log("preview", f"frame captured for {page_url}: {len(stdout)} bytes")
                     else:
-                        print(f"[Debug] ffmpeg preview produced null pixmap for {page_url}")
+                        debug_log("preview", f"FFmpeg produced a null pixmap for {page_url}")
                 else:
-                    print(f"[Debug] ffmpeg preview produced {len(stdout)} bytes for {page_url}, expected >= {expected}")
+                    debug_log(
+                        "preview",
+                        f"FFmpeg produced {len(stdout)} bytes for {page_url}; "
+                        f"expected at least {expected}",
+                    )
             except subprocess.TimeoutExpired:
-                print(f"[Debug] ffmpeg preview timed out for {page_url}")
+                debug_log("preview", f"FFmpeg frame capture timed out for {page_url}")
                 proc.kill(); proc.wait()
                 self._stream_url_cache.pop(page_url, None)
             finally:
@@ -1114,12 +1206,19 @@ class DownloadWorker(QThread):
         if not STRIPCHAT_ADAPTER or not STRIPCHAT_ADAPTER.matches(self.stream_url):
             return False
 
+        debug_log(
+            "download",
+            f"starting Stripchat native capture for {self.username}; "
+            f"resolution_limit={MAX_DOWNLOAD_RESOLUTION}, "
+            f"split={self.split_enabled}/{self.split_mode}",
+        )
         self.is_running = True
         self._stripchat_stop = False
 
         # Wrap on_log so we can detect when the adapter starts remuxing
         # and flip the "remuxing" flag on the GUI row.
         def wrapped_log(message: str):
+            debug_log("download", f"Stripchat {self.username}: {message}")
             if "Remuxing with FFmpeg" in message:
                 self.is_remuxing = True
                 self.remuxing_signal.emit(self.stream_url, True)
@@ -1127,6 +1226,10 @@ class DownloadWorker(QThread):
                 self.is_remuxing = False
                 self.remuxing_signal.emit(self.stream_url, False)
             self.log_signal.emit(self.username, message)
+
+        def report_error(message: str) -> None:
+            debug_log("download", f"Stripchat {self.username} error: {message}")
+            self.log_signal.emit(self.username, f"❌ Stripchat: {message}")
 
         def report_resolution(resolution: str, fps: int) -> Optional[int]:
             if self.cached_probe:
@@ -1184,7 +1287,7 @@ class DownloadWorker(QThread):
             ffmpeg_path=FFMPEG_PATH,
             on_log=wrapped_log,
             on_progress=lambda percent: self.progress_signal.emit(self.username, percent),
-            on_error=lambda message: self.log_signal.emit(self.username, f"❌ Stripchat: {message}"),
+            on_error=report_error,
             should_stop=lambda: self.manual_stop or self._stripchat_stop,
             on_resolution=report_resolution,
             segment_number=self.segment_number if self._during_split else None,
@@ -1202,6 +1305,12 @@ class DownloadWorker(QThread):
         self._stripchat_stop = False
         self.is_running = False
         self.automatic_split = result.split_requested and not self.manual_stop
+        debug_log(
+            "download",
+            f"Stripchat capture result for {self.username}: status={result.status}, "
+            f"split_requested={result.split_requested}, output={result.output_file!r}, "
+            f"message={result.message!r}",
+        )
         if (
             self.split_enabled
             and self.split_mode == "after"
@@ -1216,6 +1325,11 @@ class DownloadWorker(QThread):
         if not XLOVECAM_ADAPTER.matches(self.stream_url):
             return False
 
+        debug_log(
+            "download",
+            f"starting XloveCam native capture for {self.username}; "
+            f"split={self.split_enabled}/{self.split_mode}",
+        )
         self.is_running = True
         self._xlovecam_stop = False
         self._started_at = time.time()
@@ -1247,6 +1361,7 @@ class DownloadWorker(QThread):
             )
 
         def wrapped_log(message: str) -> None:
+            debug_log("download", f"XloveCam {self.username}: {message}")
             if "Remuxing with FFmpeg" in message:
                 self.is_remuxing = True
                 self.remuxing_signal.emit(self.stream_url, True)
@@ -1292,6 +1407,12 @@ class DownloadWorker(QThread):
         self.automatic_split = (
             result.split_requested and output_exists and not self.manual_stop
         )
+        debug_log(
+            "download",
+            f"XloveCam capture result for {self.username}: status={result.status}, "
+            f"output_exists={output_exists}, split_requested={result.split_requested}, "
+            f"message={result.message!r}",
+        )
         if result.status == "error":
             self.log_signal.emit(self.username, f"❌ XloveCam: {result.message}")
         elif result.status == "success":
@@ -1311,6 +1432,123 @@ class DownloadWorker(QThread):
         ):
             self._post_recording_split(result.output_file)
         self._xlovecam_stop = False
+        self.is_running = False
+        return True
+
+    def _run_myfreecams_download(self) -> bool:
+        """Record MyFreeCams' native LL-HLS playlist through FFmpeg."""
+        if not MYFREECAMS_ADAPTER.matches(self.stream_url):
+            return False
+
+        debug_log(
+            "download",
+            f"starting MyFreeCams native capture for {self.username}; "
+            f"resolution_limit={MAX_DOWNLOAD_RESOLUTION}, "
+            f"split={self.split_enabled}/{self.split_mode}",
+        )
+        self.is_running = True
+        self._myfreecams_stop = False
+        self._started_at = time.time()
+        max_duration_seconds = 0
+        if self.split_enabled and self.split_mode == "during":
+            max_duration_seconds = calculate_stream_segment_duration_seconds(
+                self.stream_url,
+                self.segment_size_mb,
+                MAX_DOWNLOAD_RESOLUTION,
+                MAX_DOWNLOAD_FPS,
+            )
+            self.log_signal.emit(
+                self.username,
+                f"📦 MyFreeCams split target: {self.segment_size_mb} MB "
+                f"(estimated {max_duration_seconds}s)",
+            )
+        elif self.split_enabled:
+            self.log_signal.emit(
+                self.username,
+                f"📦 Post-recording split size limit: {self.segment_size_mb} MB per clip",
+            )
+
+        def report_resolution(resolution: str, fps: int) -> None:
+            self._last_detected_format = (resolution, fps)
+            self.resolution_signal.emit(self.stream_url, resolution, fps)
+            self.log_signal.emit(
+                self.username,
+                f"📐 MyFreeCams stream format: {resolution} ({fps} fps)",
+            )
+
+        def wrapped_log(message: str) -> None:
+            debug_log("download", f"MyFreeCams {self.username}: {message}")
+            if "Remuxing" in message:
+                self.is_remuxing = True
+                self.remuxing_signal.emit(self.stream_url, True)
+            elif "Remuxed to:" in message:
+                self.is_remuxing = False
+                self.remuxing_signal.emit(self.stream_url, False)
+            self.log_signal.emit(self.username, message)
+
+        output_file = self._build_output_path(
+            _build_download_filename_stem(
+                self.filename_template,
+                self.stream_url,
+                self.username,
+                datetime.now(),
+                "unknown",
+                0,
+                self.segment_number if self._during_split else None,
+            ) + ".mp4"
+        )
+        self.resolution_signal.emit(self.stream_url, "", 0)
+        if self.manual_stop:
+            self.is_running = False
+            return True
+
+        result = MYFREECAMS_ADAPTER.download(
+            stream_url=self.stream_url,
+            output_file=output_file,
+            user_agent=get_user_agent() or None,
+            ffmpeg_path=FFMPEG_PATH,
+            on_log=wrapped_log,
+            should_stop=lambda: self.manual_stop or self._myfreecams_stop,
+            max_duration_seconds=max_duration_seconds,
+            subprocess_kwargs=_subprocess_kwargs(),
+            on_resolution=report_resolution,
+            max_resolution=MAX_DOWNLOAD_RESOLUTION,
+        )
+        self.is_remuxing = False
+        self.remuxing_signal.emit(self.stream_url, False)
+        output_exists = bool(
+            result.output_file
+            and os.path.isfile(result.output_file)
+            and os.path.getsize(result.output_file) > 0
+        )
+        self.automatic_split = (
+            result.split_requested and output_exists and not self.manual_stop
+        )
+        debug_log(
+            "download",
+            f"MyFreeCams capture result for {self.username}: status={result.status}, "
+            f"output_exists={output_exists}, split_requested={result.split_requested}, "
+            f"message={result.message!r}",
+        )
+        if result.status == "error":
+            self.log_signal.emit(self.username, f"❌ MyFreeCams: {result.message}")
+        elif result.status == "success":
+            self.log_signal.emit(self.username, "✓ MyFreeCams recording completed")
+            elapsed = int(time.time() - self._started_at)
+            if not self.automatic_split and elapsed < AUTO_DOWNLOAD_DISABLE_SECONDS:
+                self.short_download_signal.emit(self.stream_url, elapsed)
+        elif result.status == "stopped":
+            self.log_signal.emit(self.username, "⏹ MyFreeCams recording stopped")
+
+        if (
+            self.split_enabled
+            and self.split_mode == "after"
+            and output_exists
+            and result.output_file
+            and result.status in ("success", "stopped")
+        ):
+            self._post_recording_split(result.output_file)
+        self._myfreecams_stop = False
         self.is_running = False
         return True
 
@@ -1352,9 +1590,9 @@ class DownloadWorker(QThread):
                     return res, fps
             if r.returncode != 0:
                 err = format_error_message(r.stderr, r.stdout)
-                print(f"[Debug] DownloadWorker probe failed for {self.username}: {err}")
+                debug_log("download", f"format probe failed for {self.username}: {err}")
         except Exception as e:
-            print(f"[Debug] DownloadWorker probe failed for {self.username}: {e!r}")
+            debug_exception("download", f"format probe failed for {self.username}", e)
         return "", 0
 
     def _drain_stdout(self, proc: subprocess.Popen):
@@ -1371,10 +1609,20 @@ class DownloadWorker(QThread):
         if self.is_running:
             return
         self.is_running = True
+        debug_log(
+            "download",
+            f"worker started for {self.username}; site={extract_site(self.stream_url)}, "
+            f"output={self.output_path}, split={self.split_enabled}/{self.split_mode}",
+        )
         try:
             if self.manual_stop:
+                debug_log("download", f"worker cancelled before start for {self.username}")
+                return
+            if self._run_myfreecams_download():
+                debug_log("download", f"MyFreeCams adapter handled {self.username}")
                 return
             if self._run_xlovecam_download():
+                debug_log("download", f"XloveCam adapter handled {self.username}")
                 return
             if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(self.stream_url):
                 if self.split_enabled and self.split_mode == "during":
@@ -1394,11 +1642,13 @@ class DownloadWorker(QThread):
                     return
                 handled = self._run_stripchat_download()
                 if handled:
+                    debug_log("download", f"Stripchat adapter handled {self.username}")
                     return
 
             if self.manual_stop:
                 return
             if requires_authentication(self.stream_url, BROWSER):
+                debug_log("download", f"download blocked for {self.username}: browser required")
                 raise RuntimeError(BROWSER_REQUIRED_MSG)
 
             if self.cached_probe and self.split_enabled and self.split_mode == "during":
@@ -1409,6 +1659,10 @@ class DownloadWorker(QThread):
                 res, fps = self._probe_resolution()
 
             if res:
+                debug_log(
+                    "download",
+                    f"format probe for {self.username}: {res} at {fps or '?'} fps",
+                )
                 self.log_signal.emit(
                     self.username,
                     f"📐 Estimated format: {res} ({fps or '?'} fps)"
@@ -1420,6 +1674,7 @@ class DownloadWorker(QThread):
                 )
                 self._last_detected_format = (res, fps or MAX_DOWNLOAD_FPS)
             else:
+                debug_log("download", f"format probe returned no format for {self.username}")
                 self.log_signal.emit(self.username, "📐 Stream format unknown")
                 self.resolution_signal.emit(
                     self.stream_url,
@@ -1506,6 +1761,10 @@ class DownloadWorker(QThread):
                 need_mb_s = estimate_bandwidth_need_mb_s(res, fps)
                 if need_mb_s > 0:
                     cmd.extend(["--limit-rate", f"{need_mb_s:.2f}M"])
+                    debug_log(
+                        "download",
+                        f"applying estimated per-stream cap {need_mb_s:.2f} MB/s for {self.username}",
+                    )
             user_agent = get_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
@@ -1528,6 +1787,12 @@ class DownloadWorker(QThread):
                 )
 
             self.process = subprocess.Popen(cmd, **kwargs)
+            debug_log(
+                "download",
+                f"yt-dlp started for {self.username}: pid={self.process.pid}, "
+                f"format={get_download_format_selector()}, "
+                f"target={self._expected_output_stem}",
+            )
             self.log_signal.emit(self.username, f"▶ Download started (PID: {self.process.pid})")
 
             drain = threading.Thread(target=self._drain_stdout, args=(self.process,), daemon=True)
@@ -1577,6 +1842,7 @@ class DownloadWorker(QThread):
                 elif any(k in line.lower() for k in ("error", "warning", "finished")) and not any(
                     n in line.lower() for n in self._NOISY_PATTERNS
                 ):
+                    debug_log("download", f"yt-dlp {self.username}: {line.strip()[:1200]}")
                     message = line[:120]
                     self.log_signal.emit(self.username, message)
 
@@ -1587,6 +1853,11 @@ class DownloadWorker(QThread):
                 self.process.wait(timeout=5)
 
             has_nonempty_output = self._has_nonempty_output() if self.split_enabled else False
+            debug_log(
+                "download",
+                f"yt-dlp finished for {self.username}: exit={self.process.returncode}, "
+                f"nonempty_output={has_nonempty_output}, manual_stop={self.manual_stop}",
+            )
             output_duration = (
                 self._get_output_duration_seconds() if has_nonempty_output else None
             )
@@ -1627,8 +1898,7 @@ class DownloadWorker(QThread):
         except Exception as e:
             hint = format_error_message(str(e))
             self.log_signal.emit(self.username, f"❌ Error: {str(e)[:100]} | {hint}")
-            print(f"[Debug] DownloadWorker run failed for {self.username}: {e!r}")
-            traceback.print_exc()
+            debug_exception("download", f"worker failed for {self.username}", e)
         finally:
             self.is_running = False
             self._run_finished = True
@@ -2005,6 +2275,7 @@ class DownloadWorker(QThread):
         # would leave the .temp file behind.
         self._stripchat_stop = True
         self._xlovecam_stop = True
+        self._myfreecams_stop = True
 
         # Handle yt-dlp process if it exists
         proc = self.process
@@ -2078,6 +2349,10 @@ class SiteCheckWorker(QThread):
         if self._stop_event.wait(self._start_delay):
             return
 
+        debug_log(
+            "status",
+            f"{self.site_key} checker started (initial delay {self._start_delay:.1f}s)",
+        )
         while self._running:
             self._wake_event.clear()
             now = time.monotonic()
@@ -2093,14 +2368,24 @@ class SiteCheckWorker(QThread):
                 for url in due:
                     if not self._running:
                         break
+                    check_started = time.monotonic()
+                    debug_log("status", f"{self.site_key} checking {url}")
                     try:
                         status, message = self._check(url)
                     except Exception as exc:
-                        print(
-                            f"[Debug] {self.site_key} status check failed for "
-                            f"{url}: {exc!r}"
+                        debug_exception(
+                            "status",
+                            f"{self.site_key} status check failed for {url}",
+                            exc,
                         )
                         status, message = StreamStatus.ERROR, "❌ Site check failed"
+                    debug_log(
+                        "status",
+                        f"{self.site_key} check completed for {url}: "
+                        f"{status.value if status else 'unknown'} "
+                        f"in {time.monotonic() - check_started:.2f}s"
+                        + (f"; message={message}" if message else ""),
+                    )
 
                     checked_at = time.monotonic()
                     with self._lock:
@@ -2144,9 +2429,10 @@ class SiteCheckWorker(QThread):
 
         if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(url):
             try:
+                debug_log("status", f"Stripchat native check started for {url}")
                 result = STRIPCHAT_ADAPTER.check(url, user_agent=get_user_agent())
                 if result.value == "unknown":
-                    print(f"[Debug] Skipping status update for {url}: {result.message}")
+                    debug_log("status", f"Stripchat check unknown for {url}: {result.message}")
                     return None, result.message
 
                 status_map = {
@@ -2157,6 +2443,7 @@ class SiteCheckWorker(QThread):
                 }
                 return status_map.get(result.value, StreamStatus.ERROR), result.message
             except Exception as exc:
+                debug_exception("status", f"Stripchat native check failed for {url}", exc)
                 message = str(exc).lower()
                 if "ticket" in message or "group" in message:
                     return StreamStatus.PRIVATE, "🎫 Ticket show"
@@ -2168,10 +2455,10 @@ class SiteCheckWorker(QThread):
                     return StreamStatus.AWAY, "🌙 Away"
                 if "not currently live" in message or "off" in message:
                     return StreamStatus.OFFLINE, "💤 Offline"
-                print(f"[Debug] Stripchat live check failed for {url}: {exc!r}")
                 return StreamStatus.ERROR, "❌ Stripchat check failed"
 
         if requires_authentication(url, BROWSER):
+            debug_log("status", f"check blocked for {url}: browser authentication required")
             return StreamStatus.ERROR, f"⚠ {BROWSER_REQUIRED_MSG}"
 
         context = SiteCheckContext(
@@ -2182,9 +2469,10 @@ class SiteCheckWorker(QThread):
             subprocess_kwargs=_subprocess_kwargs(),
             format_error=format_error_message,
         )
+        debug_log("status", f"dispatching check through site policy for {url}")
         result = check_status_for_url(url, context)
         if result.value == "unknown":
-            print(f"[Debug] Skipping status update for {url}: {result.message}")
+            debug_log("status", f"site returned unknown for {url}: {result.message}")
             return None, result.message
         status_map = {
             "online": StreamStatus.ONLINE,
@@ -2284,7 +2572,7 @@ class StreamChecker(QObject):
             workers = list(self._workers.values())
         for worker in workers:
             if worker.isRunning():
-                print(f"[Debug] Terminating unresponsive {worker.objectName()}")
+                debug_log("lifecycle", f"terminating unresponsive {worker.objectName()}")
                 worker.terminate()
 
     def isRunning(self) -> bool:
@@ -2421,6 +2709,7 @@ SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "streams.js
 
 
 def load_saved_streams() -> dict:
+    debug_log("settings", f"loading saved settings from {SAVE_FILE}")
     try:
         with open(SAVE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -2454,8 +2743,10 @@ def load_saved_streams() -> dict:
                 "browser": data[0].get("browser", "") if data else "",
             }
             return {"streams": streams, "settings": settings}
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        pass
+    except FileNotFoundError:
+        debug_log("settings", "no saved settings file found; using defaults")
+    except (json.JSONDecodeError, KeyError) as exc:
+        debug_exception("settings", "saved settings could not be parsed", exc)
     return {"streams": [], "settings": {}}
 
 def save_streams(stream_items: dict) -> None:
@@ -2490,8 +2781,12 @@ def save_streams(stream_items: dict) -> None:
     try:
         with open(SAVE_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
-    except OSError:
-        pass
+        debug_log(
+            "settings",
+            f"saved {len(stream_items)} stream(s) and settings to {SAVE_FILE}",
+        )
+    except OSError as exc:
+        debug_exception("settings", f"could not save settings to {SAVE_FILE}", exc)
 
 
 # ─────────────────────────────────────────────
@@ -3428,16 +3723,27 @@ class StreamDownloaderGUI(QMainWindow):
         self.preview_worker = SharedPreviewWorker()
         self.preview_worker.setParent(self)
         self.preview_worker.preview_updated.connect(self._on_preview)
-        self.preview_worker.finished.connect(lambda: print("[Debug] SharedPreviewWorker finished"))
+        self.preview_worker.finished.connect(
+            lambda: debug_log("lifecycle", "preview worker finished")
+        )
         self.preview_worker.finished.connect(self.preview_worker.deleteLater)
-        self.preview_worker.destroyed.connect(lambda: print("[Debug] SharedPreviewWorker destroyed"))
+        self.preview_worker.destroyed.connect(
+            lambda: debug_log("lifecycle", "preview worker destroyed")
+        )
         self.preview_worker.start()
 
         self.checker = StreamChecker()
         self.checker.setParent(self)
         self.checker.status_signal.connect(self._on_status)
-        self.checker.destroyed.connect(lambda: print("[Debug] StreamChecker destroyed"))
+        self.checker.destroyed.connect(
+            lambda: debug_log("lifecycle", "stream checker destroyed")
+        )
         self.checker.start()
+        debug_log(
+            "startup",
+            f"workers started; Python={sys.version.split()[0]}, "
+            f"platform={sys.platform}, debug={debug_enabled()}",
+        )
 
         self.download_workers: Dict[str, DownloadWorker] = {}
         self.download_timers: Dict[str, DownloadTimer]   = {}
@@ -3916,6 +4222,10 @@ class StreamDownloaderGUI(QMainWindow):
             return
 
         username = extract_stream_username(url)
+        debug_log(
+            "streams",
+            f"adding {username} from {extract_site(url)}; auto_start={auto_start}",
+        )
         row = self._table.rowCount()
         self._table.insertRow(row)
         self._table.setRowHeight(row, 64)
@@ -4103,9 +4413,14 @@ class StreamDownloaderGUI(QMainWindow):
             return
         item = self.stream_items.get(url)
         if not item:
+            debug_log("queue", f"start ignored: stream is no longer tracked")
             return
 
         if item.current_status != StreamStatus.ONLINE:
+            debug_log(
+                "queue",
+                f"start rejected for {item.username}: status={item.current_status.value}",
+            )
             self._log_msg(
                 f"⚠ Can't start {item.username}: stream is not currently online",
                 "#FF9800"
@@ -4116,8 +4431,16 @@ class StreamDownloaderGUI(QMainWindow):
             current_need = self._active_download_need_mb_s()
             stream_need = self._stream_need_mb_s(item)
             queue_limit = DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S + DOWNLOAD_BANDWIDTH_HEADROOM_MB_S
+            debug_log(
+                "queue",
+                f"admission for {item.username}: active_estimate={current_need:.2f} MB/s, "
+                f"requested_estimate={stream_need:.2f} MB/s, "
+                f"configured_limit={DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S:.2f} MB/s, "
+                f"headroom={DOWNLOAD_BANDWIDTH_HEADROOM_MB_S:.2f} MB/s",
+            )
             if current_need + stream_need > queue_limit:
                 item.queued = True
+                debug_log("queue", f"queued {item.username}: estimated cap would be exceeded")
                 self._log_msg(
                     f"⏳ Queued {item.username}: needs {stream_need:.1f} MB/s, limit is {DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S:.1f} MB/s",
                     "#FF9800"
@@ -4125,6 +4448,7 @@ class StreamDownloaderGUI(QMainWindow):
                 self._update_download_info()
                 return
             item.queued = False
+            debug_log("queue", f"admitted {item.username} under estimated bandwidth limit")
 
         output_folder, space_error = select_download_output(
             self._out_input.text().strip() or "Downloads",
@@ -4133,6 +4457,7 @@ class StreamDownloaderGUI(QMainWindow):
             MINIMUM_FREE_SPACE_GB,
         )
         if space_error:
+            debug_log("queue", f"start rejected for {item.username}: {space_error}")
             self._log_msg(f"⚠ Download not started for {item.username}: {space_error}", "#F44336")
             self._status_bar.showMessage(space_error, 15000)
             if show_space_warning:
@@ -4177,6 +4502,11 @@ class StreamDownloaderGUI(QMainWindow):
         worker.remuxing_signal.connect(self._on_remuxing)
         self.download_workers[url] = worker
         worker.start()
+        debug_log(
+            "queue",
+            f"started worker for {item.username}; output_folder={output_folder}, "
+            f"during_split={during_split_enabled}, segment={segment_number}",
+        )
         item.download_active = True
         item.download_start_time = time.time()
 
@@ -4261,6 +4591,11 @@ class StreamDownloaderGUI(QMainWindow):
             return
 
         old = item.current_status
+        debug_log(
+            "status",
+            f"UI received {item.username}: {old.value} -> {status.value}"
+            + (f"; message={message}" if message else ""),
+        )
         item.current_status = status
         item.last_check_time = time.time()
         if status != old:
@@ -4330,6 +4665,7 @@ class StreamDownloaderGUI(QMainWindow):
         item = self.stream_items.get(url)
         if not item:
             return
+        debug_log("download", f"reported format for {item.username}: {res or 'unknown'} at {fps} fps")
         item.resolution = res
         item.fps = fps or 30
         worker = self.download_workers.get(url)
@@ -4448,6 +4784,12 @@ class StreamDownloaderGUI(QMainWindow):
     def _on_dl_finished(self, url: str):
         worker = self.download_workers.get(url)
         item = self.stream_items.get(url)
+        debug_log(
+            "download",
+            f"worker finished for {item.username if item else extract_stream_username(url)}; "
+            f"automatic_split={bool(worker and worker.automatic_split)}, "
+            f"manual_stop={bool(worker and worker.manual_stop)}",
+        )
         if item:
             self._log_msg(f"✓ Finished: {item.username}", "#4CAF50")
         should_continue_split = bool(
@@ -4586,9 +4928,17 @@ class StreamDownloaderGUI(QMainWindow):
         for url, item in list(self.stream_items.items()):
             if item.queued and not item.download_active and self._stream_need_mb_s(item) > 0:
                 current_need = self._active_download_need_mb_s()
+                requested_need = self._stream_need_mb_s(item)
                 queue_limit = DOWNLOAD_BANDWIDTH_SAFE_LIMIT_MB_S + DOWNLOAD_BANDWIDTH_HEADROOM_MB_S
-                if current_need + self._stream_need_mb_s(item) <= queue_limit:
+                debug_log(
+                    "queue",
+                    f"rechecking {item.username}: active_estimate={current_need:.2f} MB/s, "
+                    f"requested_estimate={requested_need:.2f} MB/s, "
+                    f"queue_limit={queue_limit:.2f} MB/s",
+                )
+                if current_need + requested_need <= queue_limit:
                     item.queued = False
+                    debug_log("queue", f"capacity available; resuming {item.username}")
                     self._log_msg(f"▶ Resuming queued stream: {item.username}", "#4CAF50")
                     self._manual_start(url, show_space_warning=False)
                     return
@@ -4773,6 +5123,11 @@ class StreamDownloaderGUI(QMainWindow):
         return True
 
     def _shutdown_workers(self):
+        debug_log(
+            "lifecycle",
+            f"shutting down; active_downloads={len(self.download_workers)}, "
+            f"tracked_streams={len(self.stream_items)}",
+        )
         for url in list(self.download_workers.keys()):
             worker = self.download_workers.get(url)
             if worker:
@@ -4790,6 +5145,7 @@ class StreamDownloaderGUI(QMainWindow):
 
         self.preview_worker.stop()
         self._wait_for_stop(self.preview_worker)
+        debug_log("lifecycle", "worker shutdown complete")
 
     def closeEvent(self, event: QEvent):
         if self.download_workers:
@@ -4812,6 +5168,11 @@ class StreamDownloaderGUI(QMainWindow):
 # ─────────────────────────────────────────────
 
 def main():
+    debug_log(
+        "startup",
+        f"launching Stream Monitor; python={sys.executable}, "
+        f"working_directory={os.getcwd()}, debug={debug_enabled()}",
+    )
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = StreamDownloaderGUI()

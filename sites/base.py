@@ -6,8 +6,38 @@ be used by tests and by the manager's non-GUI helpers.
 
 from dataclasses import dataclass, field
 import subprocess
+import time
 from typing import Callable, Optional
 from urllib.parse import urlsplit
+
+_debug_logger: Optional[Callable[[str, str], None]] = None
+_debug_exception_logger: Optional[
+    Callable[[str, str, Optional[BaseException]], None]
+] = None
+
+
+def configure_debug_logging(
+    logger: Callable[[str, str], None],
+    exception_logger: Callable[[str, str, Optional[BaseException]], None],
+) -> None:
+    """Register the application's debug logger for site modules."""
+    global _debug_logger, _debug_exception_logger
+    _debug_logger = logger
+    _debug_exception_logger = exception_logger
+
+
+def debug_log(component: str, message: str) -> None:
+    if _debug_logger is not None:
+        _debug_logger(component, message)
+
+
+def debug_exception(
+    component: str,
+    message: str,
+    exc: Optional[BaseException] = None,
+) -> None:
+    if _debug_exception_logger is not None:
+        _debug_exception_logger(component, message, exc)
 
 
 @dataclass(frozen=True)
@@ -67,6 +97,8 @@ def run_ytdlp_status_check(
     error_handler: Optional[Callable[[str, str], Optional[SiteStatus]]] = None,
 ) -> SiteStatus:
     """Run the common yt-dlp live-status probe and apply site error rules."""
+    started_at = time.monotonic()
+    debug_log("status", f"yt-dlp check started for {url}")
     try:
         command = [context.ytdlp_path, "--simulate", "--print", "%(live_status)s"]
         if context.user_agent:
@@ -85,28 +117,61 @@ def run_ytdlp_status_check(
         stderr = result.stderr.lower()
 
         if result.returncode != 0:
+            debug_log(
+                "status",
+                f"yt-dlp check exited {result.returncode} for {url}; "
+                f"stderr={result.stderr.strip()[:1200]!r}",
+            )
             if error_handler:
                 handled = error_handler(stderr, stdout)
                 if handled:
+                    debug_log(
+                        "status",
+                        f"site error handler mapped {url} to {handled.value}: "
+                        f"{handled.message}",
+                    )
                     return handled
             common_status = status_from_error(stderr)
             if common_status:
+                debug_log(
+                    "status",
+                    f"common error mapping classified {url} as "
+                    f"{common_status.value}: {common_status.message}",
+                )
                 return common_status
             error_hint = context.format_error(result.stderr, result.stdout)
+            debug_log("status", f"check failed for {url}: {error_hint}")
             return SiteStatus("error", error_hint)
 
         if stdout == "is_live":
+            debug_log(
+                "status",
+                f"{url} is online (check took {time.monotonic() - started_at:.2f}s)",
+            )
             return SiteStatus("online", "🟢 LIVE")
         if stdout in ("was_live", "not_live", "post_live"):
+            debug_log(
+                "status",
+                f"{url} is offline (yt-dlp={stdout}, "
+                f"check took {time.monotonic() - started_at:.2f}s)",
+            )
             return SiteStatus("offline", "💤 Offline")
         if not stdout:
+            debug_log(
+                "status",
+                f"empty yt-dlp status for {url}; stderr={result.stderr.strip()[:1200]!r}",
+            )
             return SiteStatus("error", "❓ Unknown (empty response)")
+        debug_log("status", f"unrecognized yt-dlp status for {url}: {stdout!r}")
         return SiteStatus("offline", f"💤 Unknown ({stdout})")
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        debug_exception("status", f"yt-dlp check timed out for {url}", exc)
         return SiteStatus("error", "⏰ Timeout")
-    except subprocess.SubprocessError:
+    except subprocess.SubprocessError as exc:
+        debug_exception("status", f"yt-dlp process error for {url}", exc)
         return SiteStatus("error", "❌ Process error")
-    except Exception:
+    except Exception as exc:
+        debug_exception("status", f"unexpected status-check error for {url}", exc)
         return SiteStatus("error", "❌ Error")
 
 
