@@ -4,6 +4,7 @@ setlocal
 set "APP_DIR=%~dp0"
 set "PYTHON=%APP_DIR%Stream_Venv\Scripts\python.exe"
 set "APP=%APP_DIR%stream_manager.py"
+set "STREAM_MONITOR_DEBUG=1"
 
 if not exist "%PYTHON%" (
     echo [ERROR] Stream_Venv\Scripts\python.exe was not found.

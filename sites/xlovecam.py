@@ -14,7 +14,13 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
 
-from .base import SiteCheckContext, SitePolicy, SiteStatus
+from .base import (
+    SiteCheckContext,
+    SitePolicy,
+    SiteStatus,
+    debug_exception,
+    debug_log,
+)
 
 
 USER_AGENT = (
@@ -236,10 +242,15 @@ def _status_for_page(html: str, username: str) -> tuple[SiteStatus, dict]:
 def check_status(url: str, context: SiteCheckContext, _check_args: list[str]) -> SiteStatus:
     username = username_from_url(url)
     if not username:
+        debug_log("XloveCam", f"invalid model URL received: {url}")
         return SiteStatus("error", "❌ Invalid XloveCam model URL")
     try:
-        return _status_for_page(_fetch_page(username, context.user_agent), username)[0]
+        debug_log("XloveCam", f"checking status for {username}")
+        status = _status_for_page(_fetch_page(username, context.user_agent), username)[0]
+        debug_log("XloveCam", f"status for {username}: {status.value} ({status.message})")
+        return status
     except requests.RequestException as exc:
+        debug_exception("XloveCam", f"status request failed for {username}", exc)
         return SiteStatus("error", f"❌ XloveCam request failed: {exc}")
 
 
@@ -333,7 +344,10 @@ class XloveCamSiteAdapter:
         subprocess_kwargs: Optional[dict] = None,
         on_resolution: Optional[Callable[[str, int], None]] = None,
     ) -> XloveCamDownloadResult:
+        username = username_from_url(stream_url)
+        debug_log("XloveCam", f"resolving live playlist for {username}")
         playlist_url = self._live_playlist(stream_url, user_agent)
+        debug_log("XloveCam", f"live playlist resolved for {username}")
         output_directory = os.path.dirname(os.path.abspath(output_file))
         os.makedirs(output_directory, exist_ok=True)
         capture_file = f"{output_file}.temp.ts"
@@ -365,14 +379,19 @@ class XloveCamSiteAdapter:
         log_lines: deque[str] = deque(maxlen=1000)
         detected_format: Optional[tuple[str, int]] = None
         log_queue: queue.Queue[Optional[str]] = queue.Queue()
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            **(subprocess_kwargs or {}),
-        )
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                **(subprocess_kwargs or {}),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            debug_exception("XloveCam", f"FFmpeg capture could not start for {username}", exc)
+            raise
+        debug_log("XloveCam", f"FFmpeg capture started for {username}: pid={process.pid}")
         if process.stderr is None:
             raise RuntimeError("FFmpeg stderr pipe was not created")
 
@@ -429,6 +448,12 @@ class XloveCamSiteAdapter:
             capture_size = os.path.getsize(capture_file)
         except OSError:
             capture_size = 0
+        debug_log(
+            "XloveCam",
+            f"capture ended for {username}: ffmpeg_exit={process.returncode}, "
+            f"bytes={capture_size}, elapsed={time.monotonic() - started_at:.1f}s, "
+            f"stopped={stopped}",
+        )
         if capture_size <= 0:
             if stopped:
                 return XloveCamDownloadResult(
@@ -469,6 +494,7 @@ class XloveCamSiteAdapter:
         )
         if on_log:
             on_log("Remuxing with FFmpeg...")
+        debug_log("XloveCam", f"starting remux for {username}; capture_bytes={capture_size}")
         remux_command = [
             ffmpeg_path,
             "-hide_banner",
@@ -488,6 +514,7 @@ class XloveCamSiteAdapter:
                 **(subprocess_kwargs or {}),
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            debug_exception("XloveCam", f"FFmpeg remux failed for {username}", exc)
             return XloveCamDownloadResult(
                 "error",
                 f"FFmpeg remux failed: {exc}. Raw capture preserved at {capture_file}",
@@ -496,6 +523,11 @@ class XloveCamSiteAdapter:
                 fps=detected_format[1] if detected_format else 0,
             )
         if remux_result.returncode != 0:
+            debug_log(
+                "XloveCam",
+                f"remux failed for {username}: exit={remux_result.returncode}, "
+                f"stderr={(remux_result.stderr or '').strip()[:1200]!r}",
+            )
             remux_error = (remux_result.stderr or remux_result.stdout or "").strip()
             if on_log:
                 on_log(

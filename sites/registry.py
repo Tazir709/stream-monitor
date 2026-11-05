@@ -9,6 +9,8 @@ from .camsoda import POLICY as CAMSODA_POLICY
 from .camsoda import check_status as check_camsoda_status
 from .chaturbate import POLICY as CHATURBATE_POLICY
 from .chaturbate import check_status as check_chaturbate_status
+from .myfreecams import POLICY as MYFREECAMS_POLICY
+from .myfreecams import check_status as check_myfreecams_status
 from .xlovecam import POLICY as XLOVECAM_POLICY
 from .xlovecam import check_status as check_xlovecam_status
 
@@ -17,12 +19,14 @@ SITE_POLICIES = (
     CHATURBATE_POLICY,
     CAMSODA_POLICY,
     BONGACAMS_POLICY,
+    MYFREECAMS_POLICY,
     XLOVECAM_POLICY,
 )
 SITE_CHECKERS = {
     CHATURBATE_POLICY.key: check_chaturbate_status,
     CAMSODA_POLICY.key: check_camsoda_status,
     BONGACAMS_POLICY.key: check_bongacams_status,
+    MYFREECAMS_POLICY.key: check_myfreecams_status,
     XLOVECAM_POLICY.key: check_xlovecam_status,
 }
 
