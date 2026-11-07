@@ -5,6 +5,7 @@ be used by tests and by the manager's non-GUI helpers.
 """
 
 from dataclasses import dataclass, field
+from http.cookiejar import CookieJar
 import subprocess
 import time
 from typing import Callable, Optional
@@ -76,6 +77,7 @@ class SiteCheckContext:
     user_agent: str
     subprocess_kwargs: dict
     format_error: Callable[[str, str], str]
+    cookies: CookieJar | dict[str, str] | None = None
 
 
 def extract_username(url: str) -> str:
