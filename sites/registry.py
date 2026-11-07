@@ -3,6 +3,8 @@
 from urllib.parse import urlsplit
 
 from .base import SiteCheckContext, SitePolicy, SiteStatus
+from .bongacams_ru4 import POLICY as BONGACAMS_RU4_POLICY
+from .bongacams_ru4 import check_status as check_bongacams_ru4_status
 from .bongacams import POLICY as BONGACAMS_POLICY
 from .bongacams import check_status as check_bongacams_status
 from .camsoda import POLICY as CAMSODA_POLICY
@@ -18,6 +20,7 @@ from .xlovecam import check_status as check_xlovecam_status
 SITE_POLICIES = (
     CHATURBATE_POLICY,
     CAMSODA_POLICY,
+    BONGACAMS_RU4_POLICY,
     BONGACAMS_POLICY,
     MYFREECAMS_POLICY,
     XLOVECAM_POLICY,
@@ -25,6 +28,7 @@ SITE_POLICIES = (
 SITE_CHECKERS = {
     CHATURBATE_POLICY.key: check_chaturbate_status,
     CAMSODA_POLICY.key: check_camsoda_status,
+    BONGACAMS_RU4_POLICY.key: check_bongacams_ru4_status,
     BONGACAMS_POLICY.key: check_bongacams_status,
     MYFREECAMS_POLICY.key: check_myfreecams_status,
     XLOVECAM_POLICY.key: check_xlovecam_status,

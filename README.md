@@ -7,6 +7,7 @@ A desktop GUI for monitoring and automatically recording live streams from multi
 - [chaturbate.com](https://chaturbate.com)
 - [stripchat.com](https://stripchat.com)
 - [bongacams.com](https://bongacams.com)
+- [ru4.bongocams.com](https://ru4.bongocams.com)
 - [camsoda.com](https://camsoda.com)
 - [myfreecams.com](https://www.myfreecams.com)
 - [xlovecam.com](https://www.xlovecam.com)
@@ -91,6 +92,7 @@ Paste a model's profile URL into the **Add Stream** field. The `https://` prefix
 | Stripchat | `stripchat.com/username` |
 | CamSoda | `camsoda.com/username` |
 | BongaCams | `bongacams.com/username` |
+| BongaCams RU4 | `ru4.bongocams.com/username` |
 | XLoveCam | `xlovecam.com/en/model/username` |
 | MyFreeCams | `myfreecams.com/#username` |
 
@@ -107,6 +109,7 @@ File-size splitting can happen during recording (with brief gaps between segment
 ## Troubleshooting
 
 - **Stream appears offline or recording fails:** if the site requires login, select a browser you are logged into under **Settings → Browser & Cookies**. A matching browser User-Agent may also help.
+- **BongaCams RU4 page access fails:** configure a browser under **Settings → Browser & Cookies**; RU4 requires browser cookies to read broadcaster pages.
 - **Chrome/Chromium cookie access fails on Windows:** export cookies from your browser with [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc), then select the exported file in Settings.
 - **FFmpeg not found:** verify `ffmpeg -version` works in a terminal and that FFmpeg is on `PATH`.
 - **Previews are missing:** previews require FFmpeg. Stripchat previews also require an FFmpeg build with the native H.264 decoder.

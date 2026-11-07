@@ -87,6 +87,10 @@ from sites.xlovecam import (
 )
 from sites.myfreecams import username_from_url as myfreecams_username_from_url
 from sites.myfreecams import MyFreeCamsSiteAdapter
+from sites.bongacams_ru4 import (
+    BongaCamsRu4SiteAdapter,
+    USER_AGENT as BONGACAMS_RU4_USER_AGENT,
+)
 from sites.base import configure_debug_logging
 
 try:
@@ -101,6 +105,7 @@ except ImportError:  # pragma: no cover - used when the helper module is unavail
 STRIPCHAT_ADAPTER = StripchatSiteAdapter() if StripchatSiteAdapter else None
 XLOVECAM_ADAPTER = XloveCamSiteAdapter()
 MYFREECAMS_ADAPTER = MyFreeCamsSiteAdapter()
+BONGACAMS_RU4_ADAPTER = BongaCamsRu4SiteAdapter()
 
 
 def debug_enabled() -> bool:
@@ -597,6 +602,33 @@ def get_cookie_args() -> list[str]:
     return ["--cookies-from-browser", BROWSER]
 
 
+def get_site_request_cookies() -> requests.cookies.RequestsCookieJar:
+    """Load configured cookies for site adapters that make HTTP requests."""
+    browser, _, profile = BROWSER.partition(":")
+    try:
+        from yt_dlp.cookies import YoutubeDLCookieJar, extract_cookies_from_browser
+
+        if (
+            COOKIES_FILE
+            and browser in _CHROMIUM_BROWSERS
+            and os.path.isfile(COOKIES_FILE)
+        ):
+            cookie_jar = YoutubeDLCookieJar(COOKIES_FILE)
+            cookie_jar.load(ignore_discard=True, ignore_expires=True)
+        elif browser:
+            cookie_jar = extract_cookies_from_browser(browser, profile or None)
+        else:
+            return requests.cookies.RequestsCookieJar()
+    except Exception as exc:
+        debug_exception("cookies", "could not load cookies for BongaCams RU4", exc)
+        raise RuntimeError(f"Could not load browser cookies: {exc}") from exc
+
+    cookies = requests.cookies.RequestsCookieJar()
+    for cookie in cookie_jar:
+        cookies.set_cookie(cookie)
+    return cookies
+
+
 # ─────────────────────────────────────────────
 BROWSER_REQUIRED_MSG = "No browser configured in Settings — required for this site's cookies/impersonate"
 
@@ -896,6 +928,27 @@ class SharedPreviewWorker(QThread):
                 debug_exception("preview", f"Stripchat preview failed for {page_url}", e)
                 return None
 
+        if BONGACAMS_RU4_ADAPTER.matches(page_url):
+            if requires_authentication(page_url, BROWSER):
+                debug_log(
+                    "preview",
+                    f"BongaCams RU4 preview blocked for {page_url}: browser authentication required",
+                )
+                return None
+            try:
+                stream_url = BONGACAMS_RU4_ADAPTER.resolve_stream_url(
+                    page_url,
+                    user_agent=get_user_agent(),
+                    cookies=get_site_request_cookies(),
+                )
+                self._stream_url_cache[page_url] = (
+                    stream_url, time.time() + self.HLS_CACHE_LIFETIME
+                )
+                return stream_url
+            except Exception as exc:
+                debug_exception("preview", f"BongaCams RU4 lookup failed for {page_url}", exc)
+                return None
+
         if requires_authentication(page_url, BROWSER):
             debug_log("preview", f"preview blocked for {page_url}: browser authentication required")
             return None
@@ -1161,6 +1214,7 @@ class DownloadWorker(QThread):
         super().__init__()
         self.setObjectName(f"DownloadWorker-{username}")
         self.stream_url  = stream_url
+        self._recording_url = stream_url
         self.username    = username
         self.filename_template = FILENAME_TEMPLATE
         self.output_path = (
@@ -1200,6 +1254,12 @@ class DownloadWorker(QThread):
         )
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         return output_file
+
+    def _recording_user_agent(self) -> str:
+        user_agent = get_user_agent()
+        if not user_agent and BONGACAMS_RU4_ADAPTER.matches(self.stream_url):
+            return BONGACAMS_RU4_USER_AGENT
+        return user_agent
 
     def _run_stripchat_download(self) -> bool:
         """Run the native Stripchat session through its site adapter."""
@@ -1565,12 +1625,12 @@ class DownloadWorker(QThread):
                 "--format", get_download_format_selector(),
                 "--print", "%(width)sx%(height)s@%(fps)s",
             ]
-            user_agent = get_user_agent()
+            user_agent = self._recording_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
             cmd.extend(get_cookie_args())
             cmd.extend(get_site_args(self.stream_url))
-            cmd.append(self.stream_url)
+            cmd.append(self._recording_url)
             r = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1624,6 +1684,19 @@ class DownloadWorker(QThread):
             if self._run_xlovecam_download():
                 debug_log("download", f"XloveCam adapter handled {self.username}")
                 return
+            if BONGACAMS_RU4_ADAPTER.matches(self.stream_url):
+                if requires_authentication(self.stream_url, BROWSER):
+                    raise RuntimeError(BROWSER_REQUIRED_MSG)
+                self.log_signal.emit(self.username, "🔍 Resolving BongaCams RU4 stream…")
+                self._recording_url = BONGACAMS_RU4_ADAPTER.resolve_stream_url(
+                    self.stream_url,
+                    user_agent=get_user_agent(),
+                    cookies=get_site_request_cookies(),
+                )
+                debug_log(
+                    "download",
+                    f"BongaCams RU4 stream resolved for {self.username}",
+                )
             if STRIPCHAT_ADAPTER and STRIPCHAT_ADAPTER.matches(self.stream_url):
                 if self.split_enabled and self.split_mode == "during":
                     self.target_duration_seconds = calculate_stream_segment_duration_seconds(
@@ -1765,12 +1838,12 @@ class DownloadWorker(QThread):
                         "download",
                         f"applying estimated per-stream cap {need_mb_s:.2f} MB/s for {self.username}",
                     )
-            user_agent = get_user_agent()
+            user_agent = self._recording_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
             cmd.extend(get_cookie_args())
             cmd.extend(get_site_args(self.stream_url))
-            cmd.append(self.stream_url)
+            cmd.append(self._recording_url)
             self._rate_limiter.wait_if_needed()
 
             kwargs: dict = {
@@ -1929,12 +2002,12 @@ class DownloadWorker(QThread):
                 need_mb_s = estimate_bandwidth_need_mb_s(resolution, fps)
                 if need_mb_s > 0:
                     cmd.extend(["--limit-rate", f"{need_mb_s:.2f}M"])
-            user_agent = get_user_agent()
+            user_agent = self._recording_user_agent()
             if user_agent:
                 cmd.extend(["--user-agent", user_agent])
             cmd.extend(get_cookie_args())
             cmd.extend(get_site_args(self.stream_url))
-            cmd.append(self.stream_url)
+            cmd.append(self._recording_url)
 
             self.log_signal.emit(
                 self.username,
@@ -2468,6 +2541,11 @@ class SiteCheckWorker(QThread):
             user_agent=get_user_agent(),
             subprocess_kwargs=_subprocess_kwargs(),
             format_error=format_error_message,
+            cookies=(
+                get_site_request_cookies()
+                if BONGACAMS_RU4_ADAPTER.matches(url)
+                else None
+            ),
         )
         debug_log("status", f"dispatching check through site policy for {url}")
         result = check_status_for_url(url, context)
@@ -2491,6 +2569,7 @@ class StreamChecker(QObject):
     SITE_ORDER = (
         "chaturbate.com",
         "stripchat.com",
+        "ru4.bongocams.com",
         "bongacams.com",
         "camsoda.com",
         "xlovecam.com",
@@ -4140,7 +4219,7 @@ class StreamDownloaderGUI(QMainWindow):
         hh.setSectionResizeMode(11, QHeaderView.Fixed)  # ✕
 
         self._table.setColumnWidth(0, 112)   # Preview
-        self._table.setColumnWidth(1, 90)    # Site
+        self._table.setColumnWidth(1, 110)   # Site
         self._table.setColumnWidth(3, 90)    # Status
         self._table.setColumnWidth(4, 90)    # Duration
         self._table.setColumnWidth(5, 80)    # Res
