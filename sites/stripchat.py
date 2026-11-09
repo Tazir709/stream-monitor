@@ -611,8 +611,24 @@ def extract_stripchat_data(username: str, user_agent: Optional[str] = None) -> d
     Returns a dict with modelId, isLive, status, and hlsPlaylist.
     """
     data = extract_preloaded_state(username, user_agent=user_agent)
-    view_cam = data.get("viewCam", {})
-    model = view_cam.get("model", {})
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Invalid PRELOADED_STATE: expected dict, got {type(data).__name__}")
+    
+
+    view_cam = data.get("viewCam")
+
+    if not isinstance(view_cam, dict):
+        raise RuntimeError(
+            f"viewCam missing or invalid. Available top-level keys: {list(data.keys())}"
+        )
+
+    model = view_cam.get("model")
+
+    if not isinstance(model, dict):
+        raise RuntimeError(
+            f"viewCam.model missing or invalid. "
+            f"viewCam keys: {list(view_cam.keys())}"
+        )
 
     model_id = model.get("id")
     if not model_id:

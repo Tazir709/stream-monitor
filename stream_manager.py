@@ -80,6 +80,7 @@ from sites import (
     SiteCheckContext,
     get_site_policy,
     hostname_from_url,
+    normalize_site_url,
 )
 from sites.xlovecam import (
     XloveCamSiteAdapter,
@@ -4292,6 +4293,7 @@ class StreamDownloaderGUI(QMainWindow):
     def _add_stream(self, url: str = "", auto_start: bool = False, silent: bool = False):
         if not url:
             url = self._url_input.text().strip()
+        url = normalize_site_url(url)
         if not url:
             QMessageBox.warning(self, "Warning", "Please enter a URL")
             return
