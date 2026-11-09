@@ -51,6 +51,46 @@ def get_site_policy(url: str) -> SitePolicy | None:
     return next((policy for policy in SITE_POLICIES if policy.matches_host(hostname)), None)
 
 
+def normalize_site_url(url: str) -> str:
+    """Canonicalize supported profile URLs for stable dispatch and storage."""
+    value = (url or "").strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = "https:" + value
+    elif "://" not in value:
+        value = "https://" + value
+
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return value
+
+    policy = get_site_policy(value)
+    if not hostname or not (
+        policy
+        or hostname == "stripchat.com"
+        or hostname.endswith(".stripchat.com")
+    ):
+        return value
+
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    netloc = hostname + (f":{port}" if port is not None else "")
+    path = parsed.path.rstrip("/") or "/"
+    fragment = parsed.fragment
+    if policy and policy.key == "myfreecams.com":
+        fragment = fragment.rstrip("/")
+    return urlsplit(value)._replace(
+        scheme="https",
+        netloc=netloc,
+        path=path,
+        fragment=fragment,
+    ).geturl()
+
+
 def display_name_for_url(url: str) -> str:
     policy = get_site_policy(url)
     if policy:

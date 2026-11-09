@@ -84,7 +84,7 @@ On Windows, you can also use the launchers in the project folder:
 
 ## Supported URL Formats
 
-Paste a model's profile URL into the **Add Stream** field. The `https://` prefix and trailing slashes are optional.
+Paste a model's profile URL into the **Add Stream** field. The `https://` prefix and trailing slashes are optional. A leading `www.` is also accepted where present; supported URLs are normalized when added, so alternate forms of the same model count as one stream.
 
 | Site | Accepted URL format |
 |---|---|
