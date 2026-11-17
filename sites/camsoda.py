@@ -8,7 +8,7 @@ from .base import SiteCheckContext, SitePolicy, SiteStatus, run_ytdlp_status_che
 
 _request_lock = threading.Lock()
 _last_request_time = 0.0
-_MIN_REQUEST_INTERVAL = 2.0
+_MIN_REQUEST_INTERVAL = 5.0
 
 
 def wait_for_request() -> None:
