@@ -88,6 +88,7 @@ from sites.xlovecam import (
 )
 from sites.myfreecams import username_from_url as myfreecams_username_from_url
 from sites.myfreecams import MyFreeCamsSiteAdapter
+from sites.camsoda import wait_for_request as wait_for_camsoda_request
 from sites.bongacams_ru4 import (
     BongaCamsRu4SiteAdapter,
     USER_AGENT as BONGACAMS_RU4_USER_AGENT,
@@ -659,6 +660,12 @@ def get_site_ffmpeg_args(url: str) -> list[str]:
     return ffmpeg_args_for_url(url)
 
 
+def _wait_for_site_request(url: str) -> None:
+    policy = get_site_policy(url)
+    if policy and policy.key == "camsoda.com":
+        wait_for_camsoda_request()
+
+
 def _find_tool(name: str) -> str:
     """Resolve an external tool (yt-dlp, ffmpeg), preferring a copy
     installed in the venv this app is actually running from — via
@@ -962,6 +969,7 @@ class SharedPreviewWorker(QThread):
             cmd.extend(get_cookie_args())
             cmd.extend(get_site_check_args(page_url))
             cmd.append(page_url)
+            _wait_for_site_request(page_url)
             r = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1084,6 +1092,7 @@ class SharedPreviewWorker(QThread):
 
         try:
             debug_log("preview", f"starting FFmpeg frame capture for {page_url}")
+            _wait_for_site_request(page_url)
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, **kwargs)
             with self._lock:
@@ -1632,6 +1641,7 @@ class DownloadWorker(QThread):
             cmd.extend(get_cookie_args())
             cmd.extend(get_site_args(self.stream_url))
             cmd.append(self._recording_url)
+            _wait_for_site_request(self.stream_url)
             r = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1846,6 +1856,7 @@ class DownloadWorker(QThread):
             cmd.extend(get_site_args(self.stream_url))
             cmd.append(self._recording_url)
             self._rate_limiter.wait_if_needed()
+            _wait_for_site_request(self.stream_url)
 
             kwargs: dict = {
                 "stdout": subprocess.PIPE,
@@ -2018,6 +2029,7 @@ class DownloadWorker(QThread):
             self._rate_limiter.wait_if_needed()
             if self.manual_stop:
                 return 0
+            _wait_for_site_request(self.stream_url)
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

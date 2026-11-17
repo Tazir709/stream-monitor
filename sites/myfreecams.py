@@ -591,7 +591,6 @@ class MyFreeCamsSiteAdapter:
                 remux_command,
                 capture_output=True,
                 text=True,
-                timeout=180,
                 **(subprocess_kwargs or {}),
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -629,7 +628,6 @@ class MyFreeCamsSiteAdapter:
                     fallback_command,
                     capture_output=True,
                     text=True,
-                    timeout=120,
                     **(subprocess_kwargs or {}),
                 )
             except (OSError, subprocess.SubprocessError) as exc:

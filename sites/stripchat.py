@@ -537,12 +537,7 @@ class StripchatDownloader(QThread):
                     cmd,
                     **_hidden_console_kwargs(),
                 )
-                try:
-                    self._ffmpeg_process.wait(timeout=120)
-                except subprocess.TimeoutExpired:
-                    self._ffmpeg_process.kill()
-                    self._ffmpeg_process.wait(timeout=5)
-                    raise
+                self._ffmpeg_process.wait()
                 if self._ffmpeg_process.returncode != 0:
                     raise RuntimeError(
                         f"ffmpeg exited with code {self._ffmpeg_process.returncode}"
@@ -570,8 +565,8 @@ class StripchatDownloader(QThread):
             self.error_signal.emit(str(e))
 
             # Keep the raw capture on error instead of deleting it -- a failed
-            # remux (bad ffmpeg path, crash, timeout, non-zero exit) shouldn't
-            # also cost the viewer everything that was actually downloaded.
+            # remux (bad ffmpeg path, crash, non-zero exit) shouldn't also cost
+            # the viewer everything that was actually downloaded.
             if self._temp_file and os.path.exists(self._temp_file):
                 # output_file is always assigned before self._temp_file is set
                 # (see above), so it's guaranteed bound here.
@@ -625,10 +620,12 @@ def extract_stripchat_data(username: str, user_agent: Optional[str] = None) -> d
     model = view_cam.get("model")
 
     if not isinstance(model, dict):
-        raise RuntimeError(
+        debug_log(
+            "Stripchat",
             f"viewCam.model missing or invalid. "
-            f"viewCam keys: {list(view_cam.keys())}"
+            f"viewCam keys: {list(view_cam.keys())}",
         )
+        return {"status": None, "isLive": False, "isAccessible": False}
 
     model_id = model.get("id")
     if not model_id:
